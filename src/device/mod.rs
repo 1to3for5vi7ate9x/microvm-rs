@@ -18,7 +18,7 @@ pub use pl011::Pl011;
 pub use gic::Gic;
 
 // Re-export commonly used virtio types
-pub use virtio::{VirtioBlk, VirtioMmioTransport, Queue};
+pub use virtio::{VirtioBlk, VirtioNet, VirtioMmioTransport, Queue};
 
 use crate::error::Result;
 

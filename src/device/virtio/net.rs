@@ -14,6 +14,12 @@ use crate::device::VirtioDevice;
 use crate::error::Result;
 use std::collections::VecDeque;
 
+use super::queue::Queue;
+
+const RX_QUEUE: usize = 0;
+const TX_QUEUE: usize = 1;
+const QUEUE_SIZE: u16 = 256;
+
 /// Virtio-net feature bits.
 #[allow(dead_code)]
 pub mod feature {
@@ -136,6 +142,12 @@ pub struct VirtioNet {
     rx_pending: VecDeque<Vec<u8>>,
     /// Is the device activated?
     activated: bool,
+    /// RX virtqueue
+    rx_queue: Queue,
+    /// TX virtqueue
+    tx_queue: Queue,
+    /// Interrupt status
+    interrupt_status: u32,
 }
 
 impl VirtioNet {
@@ -176,6 +188,9 @@ impl VirtioNet {
             backend,
             rx_pending: VecDeque::new(),
             activated: false,
+            rx_queue: Queue::new(QUEUE_SIZE),
+            tx_queue: Queue::new(QUEUE_SIZE),
+            interrupt_status: 0,
         }
     }
 
@@ -222,6 +237,231 @@ impl VirtioNet {
     /// Check if there are packets available for RX.
     pub fn has_rx_data(&self) -> bool {
         !self.rx_pending.is_empty() || self.backend.has_data()
+    }
+
+    /// Get the RX queue.
+    pub fn rx_queue(&self) -> &Queue {
+        &self.rx_queue
+    }
+
+    /// Get the RX queue mutably.
+    pub fn rx_queue_mut(&mut self) -> &mut Queue {
+        &mut self.rx_queue
+    }
+
+    /// Get the TX queue.
+    pub fn tx_queue(&self) -> &Queue {
+        &self.tx_queue
+    }
+
+    /// Get the TX queue mutably.
+    pub fn tx_queue_mut(&mut self) -> &mut Queue {
+        &mut self.tx_queue
+    }
+
+    /// Get queue by index.
+    pub fn queue(&self, idx: usize) -> Option<&Queue> {
+        match idx {
+            RX_QUEUE => Some(&self.rx_queue),
+            TX_QUEUE => Some(&self.tx_queue),
+            _ => None,
+        }
+    }
+
+    /// Get queue by index mutably.
+    pub fn queue_mut(&mut self, idx: usize) -> Option<&mut Queue> {
+        match idx {
+            RX_QUEUE => Some(&mut self.rx_queue),
+            TX_QUEUE => Some(&mut self.tx_queue),
+            _ => None,
+        }
+    }
+
+    /// Get interrupt status.
+    pub fn interrupt_status(&self) -> u32 {
+        self.interrupt_status
+    }
+
+    /// Acknowledge interrupts.
+    pub fn ack_interrupt(&mut self, value: u32) {
+        self.interrupt_status &= !value;
+    }
+
+    /// Process TX queue - send packets from guest to backend.
+    pub fn process_tx(&mut self, memory: &[u8]) -> bool {
+        let mut processed = false;
+
+        while let Some((head_idx, first_desc)) = self.tx_queue.pop_available(memory) {
+            // Collect the packet data from the descriptor chain
+            let mut packet_data = Vec::new();
+            let mut skip_header = true;
+
+            // First descriptor
+            if !first_desc.is_write_only() {
+                let offset = first_desc.addr as usize;
+                let len = first_desc.len as usize;
+                if offset + len <= memory.len() {
+                    if skip_header && len >= VirtioNetHeader::SIZE {
+                        // Skip the virtio-net header
+                        packet_data.extend_from_slice(&memory[offset + VirtioNetHeader::SIZE..offset + len]);
+                        skip_header = false;
+                    } else if !skip_header {
+                        packet_data.extend_from_slice(&memory[offset..offset + len]);
+                    }
+                }
+            }
+
+            // Follow the chain
+            let mut next_idx = if first_desc.has_next() { Some(first_desc.next) } else { None };
+            while let Some(idx) = next_idx {
+                if let Some(desc) = self.tx_queue.read_descriptor(memory, idx) {
+                    if !desc.is_write_only() {
+                        let offset = desc.addr as usize;
+                        let len = desc.len as usize;
+                        if offset + len <= memory.len() {
+                            packet_data.extend_from_slice(&memory[offset..offset + len]);
+                        }
+                    }
+                    next_idx = if desc.has_next() { Some(desc.next) } else { None };
+                } else {
+                    break;
+                }
+            }
+
+            // Send the packet
+            if !packet_data.is_empty() {
+                let _ = self.backend.send(&packet_data);
+            }
+
+            // Add to used ring (no data written for TX)
+            // Note: We need mutable access to memory for add_used, but we only have &[u8]
+            // This is a design limitation - in practice, this needs to be called with &mut memory
+            processed = true;
+
+            // Mark as used (we'll handle this externally since we can't modify memory here)
+        }
+
+        if processed {
+            self.interrupt_status |= 1;
+        }
+
+        processed
+    }
+
+    /// Process TX queue with mutable memory access.
+    pub fn process_tx_mut(&mut self, memory: &mut [u8]) -> bool {
+        let mut processed = false;
+
+        while let Some((head_idx, first_desc)) = self.tx_queue.pop_available(memory) {
+            // Collect the packet data from the descriptor chain
+            let mut packet_data = Vec::new();
+            let mut skip_header = true;
+
+            // First descriptor
+            if !first_desc.is_write_only() {
+                let offset = first_desc.addr as usize;
+                let len = first_desc.len as usize;
+                if offset + len <= memory.len() {
+                    if skip_header && len >= VirtioNetHeader::SIZE {
+                        // Skip the virtio-net header
+                        packet_data.extend_from_slice(&memory[offset + VirtioNetHeader::SIZE..offset + len]);
+                        skip_header = false;
+                    } else if !skip_header {
+                        packet_data.extend_from_slice(&memory[offset..offset + len]);
+                    }
+                }
+            }
+
+            // Follow the chain
+            let mut next_idx = if first_desc.has_next() { Some(first_desc.next) } else { None };
+            while let Some(idx) = next_idx {
+                if let Some(desc) = self.tx_queue.read_descriptor(memory, idx) {
+                    if !desc.is_write_only() {
+                        let offset = desc.addr as usize;
+                        let len = desc.len as usize;
+                        if offset + len <= memory.len() {
+                            packet_data.extend_from_slice(&memory[offset..offset + len]);
+                        }
+                    }
+                    next_idx = if desc.has_next() { Some(desc.next) } else { None };
+                } else {
+                    break;
+                }
+            }
+
+            // Send the packet
+            if !packet_data.is_empty() {
+                let _ = self.backend.send(&packet_data);
+            }
+
+            // Add to used ring
+            self.tx_queue.add_used(memory, head_idx, 0);
+            processed = true;
+        }
+
+        if processed {
+            self.interrupt_status |= 1;
+        }
+
+        processed
+    }
+
+    /// Process RX queue - receive packets from backend to guest.
+    pub fn process_rx(&mut self, memory: &mut [u8]) -> bool {
+        let mut processed = false;
+
+        // Get available packet
+        let packet = match self.pop_rx() {
+            Some(p) => p,
+            None => return false,
+        };
+
+        // Try to get an available buffer from RX queue
+        if let Some((head_idx, first_desc)) = self.rx_queue.pop_available(memory) {
+            if first_desc.is_write_only() {
+                let offset = first_desc.addr as usize;
+                let available_len = first_desc.len as usize;
+
+                if offset + available_len <= memory.len() {
+                    // Write virtio-net header
+                    let header = VirtioNetHeader::default();
+                    let header_bytes: [u8; VirtioNetHeader::SIZE] = unsafe {
+                        std::mem::transmute_copy(&header)
+                    };
+
+                    let header_len = std::cmp::min(VirtioNetHeader::SIZE, available_len);
+                    memory[offset..offset + header_len].copy_from_slice(&header_bytes[..header_len]);
+
+                    // Write packet data after header
+                    if available_len > VirtioNetHeader::SIZE {
+                        let data_space = available_len - VirtioNetHeader::SIZE;
+                        let data_len = std::cmp::min(packet.len(), data_space);
+                        memory[offset + VirtioNetHeader::SIZE..offset + VirtioNetHeader::SIZE + data_len]
+                            .copy_from_slice(&packet[..data_len]);
+
+                        let total_written = VirtioNetHeader::SIZE + data_len;
+                        self.rx_queue.add_used(memory, head_idx, total_written as u32);
+                        processed = true;
+                    }
+                }
+            }
+        } else {
+            // No available buffer, re-queue the packet
+            self.rx_pending.push_front(packet);
+        }
+
+        if processed {
+            self.interrupt_status |= 1;
+        }
+
+        processed
+    }
+
+    /// Process all queues.
+    pub fn process_queues(&mut self, memory: &mut [u8]) -> bool {
+        let tx = self.process_tx_mut(memory);
+        let rx = self.process_rx(memory);
+        tx || rx
     }
 }
 
@@ -280,6 +520,9 @@ impl VirtioDevice for VirtioNet {
         self.acked_features = 0;
         self.activated = false;
         self.rx_pending.clear();
+        self.rx_queue.reset();
+        self.tx_queue.reset();
+        self.interrupt_status = 0;
     }
 }
 
