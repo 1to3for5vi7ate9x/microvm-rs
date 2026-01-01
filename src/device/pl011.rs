@@ -21,6 +21,7 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 /// PL011 register offsets
+#[allow(dead_code)]
 mod reg {
     pub const DR: u64 = 0x000;      // Data Register
     pub const RSR: u64 = 0x004;     // Receive Status Register
@@ -48,6 +49,7 @@ mod fr {
 }
 
 /// Control Register bits
+#[allow(dead_code)]
 mod cr {
     pub const UARTEN: u32 = 1 << 0; // UART enable
     pub const TXE: u32 = 1 << 8;    // Transmit enable
@@ -58,8 +60,6 @@ mod cr {
 pub struct Pl011 {
     /// Base address in guest physical memory
     base_addr: u64,
-    /// Data register (for reads)
-    dr: u32,
     /// Flag register
     fr: u32,
     /// Integer baud rate divisor
@@ -96,7 +96,6 @@ impl Pl011 {
     pub fn with_output(base_addr: u64, output: Arc<Mutex<Box<dyn Write + Send>>>) -> Self {
         Self {
             base_addr,
-            dr: 0,
             fr: fr::TXFE | fr::RXFE, // TX empty, RX empty
             ibrd: 0,
             fbrd: 0,

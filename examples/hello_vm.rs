@@ -223,8 +223,12 @@ fn run_arm64_test(vm: &mut microvm::backend::hvf::Vm) {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run_vcpu_loop_arm64(vm: &mut microvm::backend::hvf::Vm) {
     use microvm::backend::hvf::{bindings::arm64_reg, vcpu::VcpuExit};
+    use microvm::device::Pl011;
 
     use std::io::Write;
+
+    // Create PL011 UART device
+    let mut uart = Pl011::default();
 
     print!("--- Guest output ---\n");
     let _ = std::io::stdout().flush();
@@ -234,30 +238,38 @@ fn run_vcpu_loop_arm64(vm: &mut microvm::backend::hvf::Vm) {
 
         match vcpu.run() {
             Ok(VcpuExit::MmioWrite { addr, .. }) => {
-                // UART write - print the character from X0
-                if addr == 0x09000000 {
-                    let x0 = vcpu.read_register(arm64_reg::HV_REG_X0).unwrap_or(0);
-                    print!("{}", (x0 & 0xFF) as u8 as char);
-                    let _ = std::io::stdout().flush();
+                // Check if this is a UART write
+                if uart.contains(addr) {
+                    // Get the value being written from the source register
+                    let value = vcpu.read_register(arm64_reg::HV_REG_X0).unwrap_or(0) as u32;
+                    uart.write(addr, value);
+                } else {
+                    println!("[MMIO write to unknown addr 0x{:x}]", addr);
                 }
                 // Advance PC past the store instruction (4 bytes)
                 let pc = vcpu.read_register(arm64_reg::HV_REG_PC).unwrap_or(0);
                 let _ = vcpu.write_register(arm64_reg::HV_REG_PC, pc + 4);
             }
             Ok(VcpuExit::MmioRead { addr, .. }) => {
-                // Return 0 for any MMIO read
-                let _ = vcpu.write_register(arm64_reg::HV_REG_X0, 0);
+                // Check if this is a UART read
+                let value = if uart.contains(addr) {
+                    uart.read(addr)
+                } else {
+                    println!("[MMIO read from unknown addr 0x{:x}]", addr);
+                    0
+                };
+                // Return value in X0 (destination register)
+                let _ = vcpu.write_register(arm64_reg::HV_REG_X0, value as u64);
                 let pc = vcpu.read_register(arm64_reg::HV_REG_PC).unwrap_or(0);
                 let _ = vcpu.write_register(arm64_reg::HV_REG_PC, pc + 4);
-                println!("[MMIO read from 0x{:x}]", addr);
             }
             Ok(VcpuExit::Shutdown | VcpuExit::Hlt) => {
-                println!("--- Guest halted ---");
+                println!("\n--- Guest halted ---");
                 break;
             }
             Ok(VcpuExit::Unknown(1)) => {
                 // Exit reason 1 = HV_EXIT_REASON_EXCEPTION (includes WFI)
-                println!("--- Guest halted (WFI) ---");
+                println!("\n--- Guest halted (WFI) ---");
                 break;
             }
             Ok(VcpuExit::Unknown(reason)) => {

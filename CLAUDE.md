@@ -70,13 +70,19 @@ SSH Client → vsock (SOCKS5) → microvm → OpenVPN → Target
 - [x] **MILESTONE: Code execution working!** (ARM64 "Hi!" test passes)
 - [x] MMIO exit handling (for UART output)
 - [x] WFI instruction handling (guest halt)
+- [x] PL011 UART device for ARM64
+- [x] 8250 Serial device for x86_64
+- [x] virtio-net device with backend traits (Null, Loopback)
+- [x] virtio-vsock device with connection management
+- [x] Linux kernel loader module (ARM64 Image + x86_64 bzImage)
+- [x] Device tree builder for ARM64 boot
+- [x] E820 memory map and GDT for x86_64 boot
 
 ### What's Next
-- [ ] Serial console device (8250 UART for x86, PL011 for ARM64)
-- [ ] virtio-net device
-- [ ] virtio-vsock device
-- [ ] Linux kernel loader
-- [ ] Boot minimal Linux
+- [ ] Test booting real Linux kernel
+- [ ] Port to Windows (WHP backend)
+- [ ] TAP backend for virtio-net
+- [ ] User-mode NAT/SOCKS backend
 
 ---
 
@@ -143,13 +149,19 @@ microvm-rs/
 │   │       └── mod.rs
 │   ├── device/
 │   │   ├── mod.rs         # Device traits
-│   │   ├── virtio/
-│   │   │   ├── mod.rs
-│   │   │   ├── net.rs     # virtio-net
-│   │   │   ├── blk.rs     # virtio-blk
-│   │   │   ├── vsock.rs   # virtio-vsock
-│   │   │   └── console.rs # virtio-console
-│   │   └── serial.rs      # Simple serial console (8250 UART)
+│   │   ├── pl011.rs       # ARM64 PL011 UART
+│   │   ├── serial.rs      # x86 8250 UART
+│   │   └── virtio/
+│   │       ├── mod.rs
+│   │       ├── net.rs     # virtio-net
+│   │       ├── blk.rs     # virtio-blk
+│   │       ├── vsock.rs   # virtio-vsock
+│   │       └── console.rs # virtio-console
+│   ├── loader/
+│   │   ├── mod.rs         # Kernel loader exports
+│   │   ├── linux.rs       # Linux kernel loader
+│   │   ├── arm64.rs       # ARM64 boot setup, DTB builder
+│   │   └── x86_64.rs      # x86_64 boot setup, E820, GDT
 │   └── memory/
 │       ├── mod.rs
 │       └── guest.rs       # Guest memory abstraction
@@ -285,12 +297,13 @@ Best documented platform, can leverage rust-vmm ecosystem.
 
 ### Required microvm-rs Features for Velocitty
 - [x] VM creation/destruction
-- [ ] Memory allocation
-- [ ] vCPU execution
-- [ ] Serial console (debugging)
-- [ ] virtio-net (guest networking)
-- [ ] virtio-vsock (control channel)
-- [ ] Boot Linux kernel
+- [x] Memory allocation
+- [x] vCPU execution
+- [x] Serial console (debugging) - PL011 for ARM64, 8250 for x86
+- [x] virtio-net (guest networking) - with backend trait
+- [x] virtio-vsock (control channel) - with connection management
+- [x] Linux kernel loader - ARM64 Image + x86 bzImage
+- [ ] Boot Linux kernel (needs testing with real kernel)
 - [ ] Mount rootfs
 
 ---

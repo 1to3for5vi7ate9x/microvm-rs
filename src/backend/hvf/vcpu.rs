@@ -10,14 +10,22 @@ pub enum VcpuExit {
     IoIn { port: u16, size: u8 },
     /// I/O port write (x86)
     IoOut { port: u16, data: Vec<u8> },
-    /// Memory-mapped I/O read
-    MmioRead { addr: u64, size: u8 },
-    /// Memory-mapped I/O write
-    MmioWrite { addr: u64, data: Vec<u8> },
+    /// Memory-mapped I/O read (includes syndrome for register extraction)
+    MmioRead { addr: u64, size: u8, syndrome: u64 },
+    /// Memory-mapped I/O write (includes syndrome for register extraction)
+    MmioWrite { addr: u64, data: Vec<u8>, syndrome: u64 },
     /// Guest executed HLT instruction
     Hlt,
     /// Guest shutdown
     Shutdown,
+    /// Virtual timer activated (ARM64)
+    VTimer,
+    /// HVC (Hypervisor Call) instruction executed
+    Hvc { imm: u16 },
+    /// SMC (Secure Monitor Call) instruction executed
+    Smc { imm: u16 },
+    /// WFI (Wait For Interrupt) instruction executed
+    Wfi,
     /// Unknown exit reason
     Unknown(u32),
 }
@@ -97,6 +105,12 @@ impl Vcpu {
         self.id
     }
 
+    /// Get the vCPU handle (ARM64).
+    #[cfg(target_arch = "aarch64")]
+    pub fn handle(&self) -> bindings::hv_vcpu_t {
+        self.handle
+    }
+
     /// Initialize x86_64 vCPU state.
     #[cfg(target_arch = "x86_64")]
     fn init_x86(&self) -> Result<()> {
@@ -141,8 +155,12 @@ impl Vcpu {
         // Set PC to 0 (will be updated when loading code)
         self.write_register(arm64_reg::HV_REG_PC, 0)?;
 
-        // Set CPSR (EL1h mode, interrupts masked)
+        // Set CPSR (EL1h mode, interrupts masked at startup)
+        // Bits: D=1 A=1 I=1 F=1 M=0b00101 (EL1h)
         self.write_register(arm64_reg::HV_REG_CPSR, 0x3C5)?;
+
+        // Unmask the vtimer so we get VM exits when it fires
+        self.set_vtimer_mask(false)?;
 
         Ok(())
     }
@@ -192,6 +210,36 @@ impl Vcpu {
     #[cfg(target_arch = "aarch64")]
     pub fn write_register(&self, reg: bindings::hv_reg_t, value: u64) -> Result<()> {
         let ret = unsafe { bindings::hv_vcpu_set_reg(self.handle, reg, value) };
+        hv_result(ret)
+    }
+
+    /// Set vtimer mask (ARM64).
+    #[cfg(target_arch = "aarch64")]
+    pub fn set_vtimer_mask(&self, masked: bool) -> Result<()> {
+        let ret = unsafe { bindings::hv_vcpu_set_vtimer_mask(self.handle, masked) };
+        hv_result(ret)
+    }
+
+    /// Set pending interrupt (ARM64).
+    #[cfg(target_arch = "aarch64")]
+    pub fn set_pending_interrupt(&self, interrupt_type: bindings::hv_interrupt_type_t, pending: bool) -> Result<()> {
+        let ret = unsafe { bindings::hv_vcpu_set_pending_interrupt(self.handle, interrupt_type, pending) };
+        hv_result(ret)
+    }
+
+    /// Read a system register value (ARM64).
+    #[cfg(target_arch = "aarch64")]
+    pub fn read_sys_register(&self, reg: bindings::hv_sys_reg_t) -> Result<u64> {
+        let mut value: u64 = 0;
+        let ret = unsafe { bindings::hv_vcpu_get_sys_reg(self.handle, reg, &mut value) };
+        hv_result(ret)?;
+        Ok(value)
+    }
+
+    /// Write a system register value (ARM64).
+    #[cfg(target_arch = "aarch64")]
+    pub fn write_sys_register(&self, reg: bindings::hv_sys_reg_t, value: u64) -> Result<()> {
+        let ret = unsafe { bindings::hv_vcpu_set_sys_reg(self.handle, reg, value) };
         hv_result(ret)
     }
 
@@ -252,11 +300,13 @@ impl Vcpu {
                     Ok(VcpuExit::MmioWrite {
                         addr: gpa,
                         data: vec![],  // TODO: Read actual data
+                        syndrome: 0,   // Not used on x86
                     })
                 } else {
                     Ok(VcpuExit::MmioRead {
                         addr: gpa,
                         size: 4,  // TODO: Determine actual size
+                        syndrome: 0,   // Not used on x86
                     })
                 }
             }
@@ -269,30 +319,59 @@ impl Vcpu {
     fn handle_exit_arm64(&self, exit_reason: u32) -> Result<VcpuExit> {
         use super::bindings::arm64_exit;
 
+        // Exception Class (EC) values for ARM64
+        const EC_WFI_WFE: u32 = 0x01;  // WFI/WFE trapped
+        const EC_HVC64: u32 = 0x16;    // HVC instruction in AArch64
+        const EC_SMC64: u32 = 0x17;    // SMC instruction in AArch64
+        const EC_DABT_LOW: u32 = 0x24; // Data abort from lower EL
+        const EC_DABT_CUR: u32 = 0x25; // Data abort from current EL
+
         match exit_reason {
             arm64_exit::HV_EXIT_REASON_CANCELED => Ok(VcpuExit::Shutdown),
             arm64_exit::HV_EXIT_REASON_EXCEPTION => {
                 // Parse exception syndrome
                 let syndrome = unsafe { (*self.exit_info).exception.syndrome };
-                let ec = (syndrome >> 26) & 0x3F;
+                let ec = ((syndrome >> 26) & 0x3F) as u32;
 
-                // EC 0x24 = Data abort from lower EL
-                // EC 0x20 = Instruction abort from lower EL
-                if ec == 0x24 {
-                    let addr = unsafe { (*self.exit_info).exception.physical_address };
-                    let is_write = (syndrome & 0x40) != 0;
-                    if is_write {
-                        Ok(VcpuExit::MmioWrite { addr, data: vec![] })
-                    } else {
-                        Ok(VcpuExit::MmioRead { addr, size: 4 })
+                match ec {
+                    EC_WFI_WFE => {
+                        // WFI/WFE instruction - just report it
+                        Ok(VcpuExit::Wfi)
                     }
-                } else {
-                    Ok(VcpuExit::Unknown(exit_reason))
+                    EC_HVC64 => {
+                        // HVC instruction - extract immediate value from ISS (bits 15:0)
+                        let imm = (syndrome & 0xFFFF) as u16;
+                        Ok(VcpuExit::Hvc { imm })
+                    }
+                    EC_SMC64 => {
+                        // SMC instruction - extract immediate value from ISS (bits 15:0)
+                        let imm = (syndrome & 0xFFFF) as u16;
+                        Ok(VcpuExit::Smc { imm })
+                    }
+                    EC_DABT_LOW | EC_DABT_CUR => {
+                        // Data abort (MMIO access)
+                        let addr = unsafe { (*self.exit_info).exception.physical_address };
+                        let is_write = (syndrome & 0x40) != 0;
+
+                        // Extract access size from SAS (bits 23:22)
+                        let sas = ((syndrome >> 22) & 0x3) as u8;
+                        let size = 1u8 << sas; // 1, 2, 4, or 8 bytes
+
+                        if is_write {
+                            Ok(VcpuExit::MmioWrite { addr, data: vec![], syndrome })
+                        } else {
+                            Ok(VcpuExit::MmioRead { addr, size, syndrome })
+                        }
+                    }
+                    _ => {
+                        // Unknown exception class
+                        Ok(VcpuExit::Unknown(exit_reason))
+                    }
                 }
             }
             arm64_exit::HV_EXIT_REASON_VTIMER_ACTIVATED => {
-                // Timer interrupt - guest needs to handle
-                Ok(VcpuExit::Unknown(exit_reason))
+                // Timer interrupt - inject IRQ and unmask
+                Ok(VcpuExit::VTimer)
             }
             _ => Ok(VcpuExit::Unknown(exit_reason)),
         }

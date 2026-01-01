@@ -29,6 +29,7 @@ mod vm;
 
 pub mod backend;
 pub mod device;
+pub mod loader;
 pub mod memory;
 
 // Re-exports

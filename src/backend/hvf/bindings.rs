@@ -175,6 +175,19 @@ extern "C" {
         feature_reg: hv_feature_reg_t,
         value: *mut u64,
     ) -> hv_return_t;
+
+    // Virtual timer (ARM64)
+    #[cfg(target_arch = "aarch64")]
+    pub fn hv_vcpu_get_vtimer_mask(vcpu: hv_vcpu_t, vtimer_is_masked: *mut bool) -> hv_return_t;
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn hv_vcpu_set_vtimer_mask(vcpu: hv_vcpu_t, vtimer_is_masked: bool) -> hv_return_t;
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn hv_vcpu_get_vtimer_offset(vcpu: hv_vcpu_t, vtimer_offset: *mut u64) -> hv_return_t;
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn hv_vcpu_set_vtimer_offset(vcpu: hv_vcpu_t, vtimer_offset: u64) -> hv_return_t;
 }
 
 // Basic types
@@ -351,6 +364,31 @@ pub mod arm64_reg {
     pub const HV_REG_X1: hv_reg_t = 1;
     pub const HV_REG_X2: hv_reg_t = 2;
     pub const HV_REG_X3: hv_reg_t = 3;
+    pub const HV_REG_X4: hv_reg_t = 4;
+    pub const HV_REG_X5: hv_reg_t = 5;
+    pub const HV_REG_X6: hv_reg_t = 6;
+    pub const HV_REG_X7: hv_reg_t = 7;
+    pub const HV_REG_X8: hv_reg_t = 8;
+    pub const HV_REG_X9: hv_reg_t = 9;
+    pub const HV_REG_X10: hv_reg_t = 10;
+    pub const HV_REG_X11: hv_reg_t = 11;
+    pub const HV_REG_X12: hv_reg_t = 12;
+    pub const HV_REG_X13: hv_reg_t = 13;
+    pub const HV_REG_X14: hv_reg_t = 14;
+    pub const HV_REG_X15: hv_reg_t = 15;
+    pub const HV_REG_X16: hv_reg_t = 16;
+    pub const HV_REG_X17: hv_reg_t = 17;
+    pub const HV_REG_X18: hv_reg_t = 18;
+    pub const HV_REG_X19: hv_reg_t = 19;
+    pub const HV_REG_X20: hv_reg_t = 20;
+    pub const HV_REG_X21: hv_reg_t = 21;
+    pub const HV_REG_X22: hv_reg_t = 22;
+    pub const HV_REG_X23: hv_reg_t = 23;
+    pub const HV_REG_X24: hv_reg_t = 24;
+    pub const HV_REG_X25: hv_reg_t = 25;
+    pub const HV_REG_X26: hv_reg_t = 26;
+    pub const HV_REG_X27: hv_reg_t = 27;
+    pub const HV_REG_X28: hv_reg_t = 28;
     pub const HV_REG_X29: hv_reg_t = 29; // FP
     pub const HV_REG_X30: hv_reg_t = 30; // LR
     pub const HV_REG_PC: hv_reg_t = 31;

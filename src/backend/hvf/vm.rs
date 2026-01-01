@@ -38,17 +38,28 @@ impl Vm {
         let memory = GuestMemory::new(memory_size)?;
 
         // Map memory into guest physical address space
-        // Start at address 0 for simplicity
+        // ARM64: Start at 0x40000000 (1GB) to leave room for MMIO devices below
+        // x86_64: Start at 0 for traditional PC memory map
+        #[cfg(target_arch = "aarch64")]
+        const RAM_BASE: u64 = 0x4000_0000; // 1GB - standard ARM64 virt machine layout
+        #[cfg(target_arch = "x86_64")]
+        const RAM_BASE: u64 = 0;
+
         let flags = HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC;
         let ret = unsafe {
-            bindings::hv_vm_map(memory.as_ptr() as *mut _, 0, memory.size(), flags)
+            bindings::hv_vm_map(memory.as_ptr() as *mut _, RAM_BASE, memory.size(), flags)
         };
         hv_result(ret).map_err(|_| {
             Error::HypervisorError(format!(
-                "Failed to map memory: {}",
+                "Failed to map memory at 0x{:x}: {}",
+                RAM_BASE,
                 bindings::hv_return_string(ret)
             ))
         })?;
+
+        // Note: With RAM at 0x40000000, MMIO regions (GIC at 0x08000000, UART at 0x09000000)
+        // are naturally separate from RAM. No need to unmap anything - accesses to those
+        // addresses will cause data abort exceptions that we handle as MMIO.
 
         // Create vCPUs
         let mut vcpus = Vec::with_capacity(config.vcpus as usize);

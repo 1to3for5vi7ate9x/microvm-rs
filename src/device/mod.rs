@@ -5,6 +5,18 @@
 pub mod serial;
 pub mod virtio;
 
+#[cfg(target_arch = "aarch64")]
+pub mod pl011;
+
+#[cfg(target_arch = "aarch64")]
+pub mod gic;
+
+#[cfg(target_arch = "aarch64")]
+pub use pl011::Pl011;
+
+#[cfg(target_arch = "aarch64")]
+pub use gic::Gic;
+
 use crate::error::Result;
 
 /// Trait for virtio devices.

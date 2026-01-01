@@ -28,6 +28,15 @@ desktop.ini
 *.qcow2
 vmlinuz*
 initrd*
+test-assets/
+guest/
+
+# Linux kernel source
+linux-*.tar.xz
+linux-*/
+
+# Code signing
+entitlements.plist
 
 # Coverage
 *.profraw

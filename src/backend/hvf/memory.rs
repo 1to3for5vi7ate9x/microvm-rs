@@ -141,6 +141,13 @@ impl Drop for GuestMemory {
     }
 }
 
+// Implement MemoryWriter trait for kernel loader
+impl crate::loader::linux::MemoryWriter for GuestMemory {
+    fn write(&mut self, addr: usize, data: &[u8]) -> Result<()> {
+        GuestMemory::write(self, addr, data)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
