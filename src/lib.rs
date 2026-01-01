@@ -26,6 +26,7 @@
 mod builder;
 mod error;
 mod vm;
+pub mod runner;
 
 pub mod backend;
 pub mod device;

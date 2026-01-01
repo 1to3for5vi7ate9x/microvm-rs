@@ -25,7 +25,7 @@ use crate::backend::{HypervisorBackend, VmConfig};
 use crate::error::Result;
 
 pub use memory::GuestMemory;
-pub use vcpu::Vcpu;
+pub use vcpu::{Vcpu, VcpuExit};
 pub use vm::Vm;
 
 /// Check if Hypervisor.framework is available.
