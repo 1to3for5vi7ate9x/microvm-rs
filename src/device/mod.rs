@@ -17,6 +17,9 @@ pub use pl011::Pl011;
 #[cfg(target_arch = "aarch64")]
 pub use gic::Gic;
 
+// Re-export commonly used virtio types
+pub use virtio::{VirtioBlk, VirtioMmioTransport, Queue};
+
 use crate::error::Result;
 
 /// Trait for virtio devices.

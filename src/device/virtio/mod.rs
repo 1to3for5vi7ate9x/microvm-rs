@@ -3,10 +3,16 @@
 //! This module provides virtio-mmio device emulation.
 //! Devices are exposed to the guest via memory-mapped I/O.
 
+pub mod queue;
+pub mod mmio_transport;
 pub mod net;
 pub mod vsock;
 pub mod blk;
 pub mod console;
+
+pub use queue::{Queue, Descriptor, DescriptorChain};
+pub use mmio_transport::{VirtioMmioTransport, VIRTIO_MMIO_SIZE};
+pub use blk::VirtioBlk;
 
 /// Virtio MMIO register offsets.
 pub mod mmio {
