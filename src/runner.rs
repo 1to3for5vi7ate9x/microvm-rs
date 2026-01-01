@@ -5,15 +5,10 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread::JoinHandle;
 
 use crate::error::{Error, Result};
-
-#[cfg(target_arch = "aarch64")]
-use crate::backend::hvf::{bindings::arm64_reg, VcpuExit, Vm, Vcpu};
-
-#[cfg(target_arch = "x86_64")]
-use crate::backend::hvf::{VcpuExit, Vm, Vcpu};
+use crate::backend::hvf::VcpuExit;
 
 /// Exit handler callback type.
 /// Returns true to continue running, false to stop.
@@ -35,6 +30,7 @@ struct VcpuThread {
     /// Thread handle.
     handle: Option<JoinHandle<Result<()>>>,
     /// vCPU ID.
+    #[allow(dead_code)]
     id: usize,
 }
 

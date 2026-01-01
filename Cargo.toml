@@ -54,6 +54,10 @@ kvm-bindings = { version = "0.7", optional = true }
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 
+[[bin]]
+name = "microvm"
+path = "src/bin/microvm.rs"
+
 [[example]]
 name = "minimal"
 path = "examples/minimal.rs"
