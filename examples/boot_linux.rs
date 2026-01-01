@@ -95,13 +95,13 @@ fn run_linux_boot(kernel_path: &str, initrd_path: Option<&str>) {
         };
     }
 
-    // Set command line
-    let loader = loader.with_cmdline("console=ttyAMA0 earlycon=pl011,0x09000000 earlyprintk panic=1 root=/dev/ram0");
+    // Set command line - use rdinit to go straight to shell
+    let loader = loader.with_cmdline("console=ttyAMA0 earlycon=pl011,0x09000000 panic=1 rdinit=/bin/sh");
 
-    // Create VM with more memory for the kernel
+    // Create VM with more memory for the kernel and initrd
     println!("\nCreating VM...");
     let config = VmConfig {
-        memory_mb: 512, // 512MB to accommodate larger kernels
+        memory_mb: 1024, // 1GB to accommodate kernel + initrd + userspace
         vcpus: 1,
         kernel: Some(kernel_path.into()),
         initrd: initrd_path.map(|s| s.into()),
@@ -145,9 +145,11 @@ fn run_linux_boot(kernel_path: &str, initrd_path: Option<&str>) {
     // ARM64 RAM starts at 0x40000000 (see vm.rs and arm64.rs)
     const RAM_BASE: u64 = 0x4000_0000;
 
-    // Place initrd after kernel with some padding (at RAM_BASE + 32MB)
+    // Place initrd after kernel with some padding
+    // Kernel is at RAM_BASE + 2MB, and can be up to ~40MB
+    // So place initrd at RAM_BASE + 64MB to be safe
     let initrd_info = if let Some(initrd_data) = loader.initrd_data() {
-        let initrd_gpa = RAM_BASE + 0x200_0000; // RAM_BASE + 32MB
+        let initrd_gpa = RAM_BASE + 0x400_0000; // RAM_BASE + 64MB
         let initrd_end = initrd_gpa + initrd_data.len() as u64;
         let initrd_offset = (initrd_gpa - RAM_BASE) as usize;
         vm.memory_mut().write(initrd_offset, initrd_data).unwrap();
@@ -158,7 +160,7 @@ fn run_linux_boot(kernel_path: &str, initrd_path: Option<&str>) {
     };
 
     let dtb = microvm::loader::arm64::DeviceTreeBuilder::build_minimal(
-        512 * 1024 * 1024, // 512MB
+        1024 * 1024 * 1024, // 1GB
         loader.cmdline(),
         initrd_info.map(|(s, _)| s),
         initrd_info.map(|(_, e)| e),
@@ -434,7 +436,7 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
     let max_iterations = 100_000_000;
     let mut last_tick = 0u64;
     let start_time = std::time::Instant::now();
-    let max_runtime = std::time::Duration::from_secs(120); // 2 minute timeout
+    let max_runtime = std::time::Duration::from_secs(300); // 5 minute timeout
 
     for i in 0..max_iterations {
         // Check for timeout
