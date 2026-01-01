@@ -1,0 +1,63 @@
+[package]
+name = "microvm"
+version = "0.1.0"
+edition = "2021"
+authors = ["Ankit Choudhary"]
+description = "Cross-platform, embeddable microVM library"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/anthropics/microvm-rs"
+keywords = ["virtualization", "hypervisor", "microvm", "kvm", "hvf"]
+categories = ["virtualization", "os"]
+
+[features]
+default = []
+
+# Platform backends (auto-detected if not specified)
+hvf = []   # macOS Hypervisor.framework
+whp = []   # Windows Hypervisor Platform
+kvm = []   # Linux KVM
+
+# Devices
+virtio-net = []
+virtio-blk = []
+virtio-vsock = []
+virtio-console = []
+
+# Optional
+serde = ["dep:serde"]
+tracing = ["dep:tracing"]
+
+[dependencies]
+thiserror = "1.0"
+bitflags = "2.4"
+libc = "0.2"
+
+# Optional dependencies
+serde = { version = "1.0", features = ["derive"], optional = true }
+tracing = { version = "0.1", optional = true }
+
+# Platform-specific dependencies
+[target.'cfg(target_os = "macos")'.dependencies]
+# HVF bindings - we'll write our own
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_Hypervisor",
+    "Win32_System_Memory",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+kvm-ioctls = { version = "0.16", optional = true }
+kvm-bindings = { version = "0.7", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[[example]]
+name = "minimal"
+path = "examples/minimal.rs"
+
+[[example]]
+name = "boot_linux"
+path = "examples/boot_linux.rs"

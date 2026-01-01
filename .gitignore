@@ -1,0 +1,35 @@
+# Rust
+/target
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# Test artifacts
+*.img
+*.qcow2
+vmlinuz*
+initrd*
+
+# Coverage
+*.profraw
+*.profdata
+coverage/
