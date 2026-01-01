@@ -289,26 +289,116 @@ fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Translate a kernel virtual address to physical address by walking page tables.
+#[cfg(target_arch = "aarch64")]
+fn translate_va_to_pa(memory: &[u8], ttbr: u64, va: u64) -> Option<u64> {
+    const RAM_BASE: u64 = 0x4000_0000;
+
+    let pa_to_offset = |pa: u64| -> Option<usize> {
+        if pa >= RAM_BASE && (pa - RAM_BASE) < memory.len() as u64 {
+            Some((pa - RAM_BASE) as usize)
+        } else {
+            None
+        }
+    };
+
+    // 4KB granule, 4-level page tables (48-bit VA)
+    let table_base = ttbr & 0x0000_FFFF_FFFF_F000;
+    let va_masked = va & 0x0000_FFFF_FFFF_FFFF;
+
+    let l0_idx = ((va_masked >> 39) & 0x1FF) as usize;
+    let l1_idx = ((va_masked >> 30) & 0x1FF) as usize;
+    let l2_idx = ((va_masked >> 21) & 0x1FF) as usize;
+    let l3_idx = ((va_masked >> 12) & 0x1FF) as usize;
+    let page_offset = (va_masked & 0xFFF) as u64;
+
+    // L0
+    let l0_offset = pa_to_offset(table_base)? + (l0_idx * 8);
+    if l0_offset + 8 > memory.len() { return None; }
+    let l0_desc = u64::from_le_bytes(memory[l0_offset..l0_offset+8].try_into().ok()?);
+    if (l0_desc & 0x3) != 0x3 { return None; }
+    let l1_table = l0_desc & 0x0000_FFFF_FFFF_F000;
+
+    // L1
+    let l1_offset = pa_to_offset(l1_table)? + (l1_idx * 8);
+    if l1_offset + 8 > memory.len() { return None; }
+    let l1_desc = u64::from_le_bytes(memory[l1_offset..l1_offset+8].try_into().ok()?);
+    if (l1_desc & 0x3) == 0x1 {
+        return Some((l1_desc & 0x0000_FFFF_C000_0000) | (va_masked & 0x3FFF_FFFF));
+    }
+    if (l1_desc & 0x3) != 0x3 { return None; }
+    let l2_table = l1_desc & 0x0000_FFFF_FFFF_F000;
+
+    // L2
+    let l2_offset = pa_to_offset(l2_table)? + (l2_idx * 8);
+    if l2_offset + 8 > memory.len() { return None; }
+    let l2_desc = u64::from_le_bytes(memory[l2_offset..l2_offset+8].try_into().ok()?);
+    if (l2_desc & 0x3) == 0x1 {
+        return Some((l2_desc & 0x0000_FFFF_FFE0_0000) | (va_masked & 0x001F_FFFF));
+    }
+    if (l2_desc & 0x3) != 0x3 { return None; }
+    let l3_table = l2_desc & 0x0000_FFFF_FFFF_F000;
+
+    // L3
+    let l3_offset = pa_to_offset(l3_table)? + (l3_idx * 8);
+    if l3_offset + 8 > memory.len() { return None; }
+    let l3_desc = u64::from_le_bytes(memory[l3_offset..l3_offset+8].try_into().ok()?);
+    if (l3_desc & 0x3) != 0x3 { return None; }
+
+    Some((l3_desc & 0x0000_FFFF_FFFF_F000) | page_offset)
+}
+
+/// Handle PSCI/SMCCC calls.
+#[cfg(target_arch = "aarch64")]
+fn handle_psci_call(function_id: u64) -> u64 {
+    const PSCI_SUCCESS: u64 = 0;
+    const PSCI_NOT_SUPPORTED: u64 = !0u64;
+
+    match function_id {
+        // SMCCC
+        0x80000000 => 0x00010001,  // SMCCC_VERSION -> 1.1
+        0x80000001 => PSCI_NOT_SUPPORTED,  // SMCCC_ARCH_FEATURES
+        0x80000002 => PSCI_NOT_SUPPORTED,  // SMCCC_ARCH_SOC_ID
+        0x80008000 | 0x80007FFF | 0x80003FFF => PSCI_NOT_SUPPORTED,  // Workarounds
+
+        // PSCI
+        0x84000000 => 0x00010000,  // PSCI_VERSION -> 1.0
+        0x84000001 | 0xC4000001 => PSCI_SUCCESS,  // CPU_SUSPEND
+        0x84000002 => PSCI_SUCCESS,  // CPU_OFF
+        0x84000003 | 0xC4000003 => PSCI_NOT_SUPPORTED,  // CPU_ON (single CPU)
+        0x84000004 | 0xC4000004 => 0,  // AFFINITY_INFO -> ON
+        0x84000006 => 2,  // MIGRATE_INFO_TYPE -> no migration
+        0x84000008 => PSCI_SUCCESS,  // SYSTEM_OFF
+        0x84000009 => PSCI_SUCCESS,  // SYSTEM_RESET
+        0x8400000A => PSCI_SUCCESS,  // PSCI_FEATURES
+
+        // Unknown
+        _ => PSCI_NOT_SUPPORTED,
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 fn run_vm_loop(vm: &mut Vm) -> Result<(), Box<dyn std::error::Error>> {
-    use microvm::backend::hvf::bindings::arm64_reg;
+    use microvm::backend::hvf::bindings::{arm64_reg, arm64_sys_reg};
 
-    let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
+    const RAM_BASE: u64 = 0x4000_0000;
 
     loop {
-        let exit = vcpu.run()?;
+        let exit = {
+            let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
+            vcpu.run()?
+        };
 
         match exit {
             VcpuExit::MmioWrite { addr, syndrome, .. } => {
+                let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
                 // Handle UART writes
                 if addr >= 0x0900_0000 && addr < 0x0900_1000 {
                     let offset = addr - 0x0900_0000;
                     if offset == 0 {
-                        // UART data register
                         let srt = ((syndrome >> 16) & 0x1f) as u32;
                         let value = if srt < 31 {
-                            let reg = arm64_reg::HV_REG_X0 + srt;
-                            vcpu.read_register(reg).unwrap_or(0) as u8
+                            vcpu.read_register(arm64_reg::HV_REG_X0 + srt).unwrap_or(0) as u8
                         } else {
                             0
                         };
@@ -317,15 +407,13 @@ fn run_vm_loop(vm: &mut Vm) -> Result<(), Box<dyn std::error::Error>> {
                         std::io::stdout().flush().ok();
                     }
                 }
-                // Advance PC
                 let pc = vcpu.read_register(arm64_reg::HV_REG_PC)?;
                 vcpu.write_register(arm64_reg::HV_REG_PC, pc + 4)?;
             }
             VcpuExit::MmioRead { addr, syndrome, .. } => {
-                // Handle UART reads
+                let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
                 let value = if addr >= 0x0900_0000 && addr < 0x0900_1000 {
-                    let offset = addr - 0x0900_0000;
-                    match offset {
+                    match addr - 0x0900_0000 {
                         0x18 => 0x00, // UART flag register - TX empty
                         _ => 0,
                     }
@@ -333,41 +421,99 @@ fn run_vm_loop(vm: &mut Vm) -> Result<(), Box<dyn std::error::Error>> {
                     0
                 };
 
-                // Write value to destination register
                 let srt = ((syndrome >> 16) & 0x1f) as u32;
                 if srt < 31 {
-                    let reg = arm64_reg::HV_REG_X0 + srt;
-                    vcpu.write_register(reg, value)?;
+                    vcpu.write_register(arm64_reg::HV_REG_X0 + srt, value)?;
+                }
+                let pc = vcpu.read_register(arm64_reg::HV_REG_PC)?;
+                vcpu.write_register(arm64_reg::HV_REG_PC, pc + 4)?;
+            }
+            VcpuExit::Hvc { .. } | VcpuExit::Smc { .. } => {
+                // Read registers needed for PSCI handling
+                let (x0, x8, x30, pc, ttbr1) = {
+                    let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
+                    (
+                        vcpu.read_register(arm64_reg::HV_REG_X0).unwrap_or(0),
+                        vcpu.read_register(arm64_reg::HV_REG_X8).unwrap_or(0),
+                        vcpu.read_register(arm64_reg::HV_REG_X30).unwrap_or(0),
+                        vcpu.read_register(arm64_reg::HV_REG_PC).unwrap_or(0),
+                        vcpu.read_sys_register(arm64_sys_reg::HV_SYS_REG_TTBR1_EL1).unwrap_or(0),
+                    )
+                };
+
+                let result = handle_psci_call(x0);
+
+                // Set return value
+                {
+                    let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
+                    vcpu.write_register(arm64_reg::HV_REG_X0, result)?;
                 }
 
-                // Advance PC
-                let pc = vcpu.read_register(arm64_reg::HV_REG_PC)?;
-                vcpu.write_register(arm64_reg::HV_REG_PC, pc + 4)?;
-            }
-            VcpuExit::Hvc { .. } => {
-                // Handle PSCI calls
-                let x0 = vcpu.read_register(arm64_reg::HV_REG_X0)?;
-                let result = match x0 as u32 {
-                    0x84000000 => 0x00010001u64, // PSCI_VERSION -> 1.1
-                    0x84000001 => 0u64,           // CPU_SUSPEND
-                    0x84000009 => 0u64,           // SYSTEM_RESET
-                    0x84000008 => 0u64,           // SYSTEM_OFF
-                    0xC4000001 => 0u64,           // CPU_ON
-                    _ => !0u64,                   // NOT_SUPPORTED
-                };
-                vcpu.write_register(arm64_reg::HV_REG_X0, result)?;
+                // WORKAROUND: HVF has a cache coherency issue where LDR X4, [SP]
+                // returns 0 after HVC. We bypass the kernel's SMCCC wrapper by:
+                // 1. Writing results directly to the result struct in guest memory
+                // 2. Jumping to LR to return to the caller
+                if x8 != 0 && (x8 & 0xffff_0000_0000_0000) == 0xffff_0000_0000_0000 {
+                    let memory = vm.memory_mut().as_mut_slice();
+                    if let Some(res_pa) = translate_va_to_pa(memory, ttbr1, x8) {
+                        let offset = if res_pa >= RAM_BASE {
+                            (res_pa - RAM_BASE) as usize
+                        } else {
+                            usize::MAX
+                        };
 
-                // Advance PC
-                let pc = vcpu.read_register(arm64_reg::HV_REG_PC)?;
-                vcpu.write_register(arm64_reg::HV_REG_PC, pc + 4)?;
+                        if offset != usize::MAX && (offset + 32) <= memory.len() {
+                            // Write SMCCC result struct: x0, x1, x2, x3
+                            memory[offset..offset + 8].copy_from_slice(&result.to_le_bytes());
+                            memory[offset + 8..offset + 16].copy_from_slice(&0u64.to_le_bytes());
+                            memory[offset + 16..offset + 24].copy_from_slice(&0u64.to_le_bytes());
+                            memory[offset + 24..offset + 32].copy_from_slice(&0u64.to_le_bytes());
+
+                            // Skip SMCCC wrapper by jumping to LR
+                            let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
+                            vcpu.write_register(arm64_reg::HV_REG_PC, x30)?;
+                        } else {
+                            let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
+                            vcpu.write_register(arm64_reg::HV_REG_PC, pc + 4)?;
+                        }
+                    } else {
+                        let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
+                        vcpu.write_register(arm64_reg::HV_REG_PC, pc + 4)?;
+                    }
+                } else {
+                    let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
+                    vcpu.write_register(arm64_reg::HV_REG_PC, pc + 4)?;
+                }
             }
             VcpuExit::Wfi => {
-                // Wait for interrupt - just continue
                 std::thread::sleep(std::time::Duration::from_micros(100));
             }
             VcpuExit::VTimer => {
-                // Timer interrupt
+                let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
                 vcpu.set_vtimer_mask(true)?;
+            }
+            VcpuExit::SystemRegAccess { is_write, rt, .. } => {
+                // Handle system register access - skip the instruction
+                let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
+                if !is_write {
+                    // Read: return 0 for unknown registers
+                    vcpu.write_register(arm64_reg::HV_REG_X0 + rt as u32, 0)?;
+                }
+                // Advance PC past the MSR/MRS instruction
+                let pc = vcpu.read_register(arm64_reg::HV_REG_PC)?;
+                vcpu.write_register(arm64_reg::HV_REG_PC, pc + 4)?;
+            }
+            VcpuExit::Breakpoint { .. } => {
+                let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
+                let pc = vcpu.read_register(arm64_reg::HV_REG_PC)?;
+                eprintln!("Breakpoint at PC=0x{:x}", pc);
+                break;
+            }
+            VcpuExit::Exception { ec, syndrome } => {
+                let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
+                let pc = vcpu.read_register(arm64_reg::HV_REG_PC)?;
+                eprintln!("Exception EC=0x{:02x} syndrome=0x{:08x} at PC=0x{:x}", ec, syndrome, pc);
+                break;
             }
             VcpuExit::Shutdown => {
                 break;

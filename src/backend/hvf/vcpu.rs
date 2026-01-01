@@ -26,6 +26,12 @@ pub enum VcpuExit {
     Smc { imm: u16 },
     /// WFI (Wait For Interrupt) instruction executed
     Wfi,
+    /// System register access (MSR/MRS)
+    SystemRegAccess { reg: u32, is_write: bool, rt: u8, syndrome: u64 },
+    /// Breakpoint (BRK instruction)
+    Breakpoint { imm: u16 },
+    /// Unknown exception with EC and syndrome for debugging
+    Exception { ec: u32, syndrome: u64 },
     /// Unknown exit reason
     Unknown(u32),
 }
@@ -320,11 +326,19 @@ impl Vcpu {
         use super::bindings::arm64_exit;
 
         // Exception Class (EC) values for ARM64
+        const EC_UNKNOWN: u32 = 0x00;  // Unknown reason
         const EC_WFI_WFE: u32 = 0x01;  // WFI/WFE trapped
+        const EC_SVC64: u32 = 0x15;    // SVC instruction in AArch64
         const EC_HVC64: u32 = 0x16;    // HVC instruction in AArch64
         const EC_SMC64: u32 = 0x17;    // SMC instruction in AArch64
+        const EC_MSR_MRS: u32 = 0x18;  // MSR/MRS/System register access
+        const EC_IABT_LOW: u32 = 0x20; // Instruction abort from lower EL
+        const EC_IABT_CUR: u32 = 0x21; // Instruction abort from current EL
+        const EC_PC_ALIGN: u32 = 0x22; // PC alignment fault
         const EC_DABT_LOW: u32 = 0x24; // Data abort from lower EL
         const EC_DABT_CUR: u32 = 0x25; // Data abort from current EL
+        const EC_SP_ALIGN: u32 = 0x26; // SP alignment fault
+        const EC_BRK: u32 = 0x3C;      // BRK instruction (breakpoint)
 
         match exit_reason {
             arm64_exit::HV_EXIT_REASON_CANCELED => Ok(VcpuExit::Shutdown),
@@ -334,7 +348,7 @@ impl Vcpu {
                 let ec = ((syndrome >> 26) & 0x3F) as u32;
 
                 match ec {
-                    EC_WFI_WFE => {
+                    EC_UNKNOWN | EC_WFI_WFE => {
                         // WFI/WFE instruction - just report it
                         Ok(VcpuExit::Wfi)
                     }
@@ -347,6 +361,19 @@ impl Vcpu {
                         // SMC instruction - extract immediate value from ISS (bits 15:0)
                         let imm = (syndrome & 0xFFFF) as u16;
                         Ok(VcpuExit::Smc { imm })
+                    }
+                    EC_MSR_MRS => {
+                        // MSR/MRS system register access
+                        // ISS encoding: Op0[21:20], Op2[19:17], Op1[16:14], CRn[13:10], Rt[9:5], CRm[4:1], Dir[0]
+                        let is_write = (syndrome & 1) == 0; // Direction: 0=write, 1=read
+                        let rt = ((syndrome >> 5) & 0x1F) as u8;
+                        let reg = ((syndrome >> 1) & 0xFFFFF) as u32; // System register encoding
+                        Ok(VcpuExit::SystemRegAccess { reg, is_write, rt, syndrome })
+                    }
+                    EC_BRK => {
+                        // BRK instruction (breakpoint)
+                        let imm = (syndrome & 0xFFFF) as u16;
+                        Ok(VcpuExit::Breakpoint { imm })
                     }
                     EC_DABT_LOW | EC_DABT_CUR => {
                         // Data abort (MMIO access)
@@ -364,8 +391,8 @@ impl Vcpu {
                         }
                     }
                     _ => {
-                        // Unknown exception class
-                        Ok(VcpuExit::Unknown(exit_reason))
+                        // Unknown exception class - return with EC for debugging
+                        Ok(VcpuExit::Exception { ec, syndrome })
                     }
                 }
             }
