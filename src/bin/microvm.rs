@@ -228,9 +228,8 @@ fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if initrd_path.is_some() {
-        cmdline.push_str(" rdinit=/bin/sh");
-    }
+    // Note: The initrd's /init will run by default.
+    // To force an interactive shell, use: --cmdline "... rdinit=/bin/sh"
 
     loader = loader.with_cmdline(&cmdline);
 
@@ -254,14 +253,18 @@ fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(target_arch = "aarch64")]
     {
-        // Build device tree
+        // Build device tree with initrd addresses if present
         let memory_size = (memory_mb as u64) * 1024 * 1024;
         let dtb = microvm::loader::arm64::DeviceTreeBuilder::build_minimal(
             memory_size,
             loader.cmdline(),
-            None, // TODO: initrd addresses
-            None,
+            kernel_info.initrd_start,
+            kernel_info.initrd_end,
         );
+
+        if let (Some(start), Some(end)) = (kernel_info.initrd_start, kernel_info.initrd_end) {
+            println!("  Initrd: 0x{:x} - 0x{:x} ({} bytes)", start, end, end - start);
+        }
 
         const RAM_BASE: u64 = 0x4000_0000;
         const DTB_OFFSET: usize = 0x1_0000;

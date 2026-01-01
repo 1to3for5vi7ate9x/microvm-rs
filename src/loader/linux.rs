@@ -28,6 +28,10 @@ pub struct KernelInfo {
     pub size: usize,
     /// Kernel format
     pub format: KernelFormat,
+    /// Initrd start address (if loaded)
+    pub initrd_start: Option<u64>,
+    /// Initrd end address (if loaded)
+    pub initrd_end: Option<u64>,
 }
 
 /// Kernel image format.
@@ -183,20 +187,23 @@ impl LinuxLoader {
         memory.write(offset, &self.kernel_data)?;
 
         // Load initrd if present
-        if let Some(initrd) = &self.initrd_data {
+        let (initrd_start, initrd_end) = if let Some(initrd) = &self.initrd_data {
             // Place initrd after kernel, aligned to 4KB
             let initrd_gpa = align_up(load_addr + self.kernel_data.len() as u64, 4096);
             let initrd_offset = (initrd_gpa - RAM_BASE) as usize;
             memory.write(initrd_offset, initrd)?;
-        }
-
-        // TODO: Set up device tree with boot parameters
+            (Some(initrd_gpa), Some(initrd_gpa + initrd.len() as u64))
+        } else {
+            (None, None)
+        };
 
         Ok(KernelInfo {
             entry,
             load_addr,
             size: self.kernel_data.len(),
             format: KernelFormat::Arm64Image,
+            initrd_start,
+            initrd_end,
         })
     }
 
@@ -268,11 +275,19 @@ impl LinuxLoader {
             memory.write((BOOT_PARAMS_ADDR + 0x21c) as usize, &size_bytes)?;
         }
 
+        let (initrd_start, initrd_end) = if let Some(initrd) = &self.initrd_data {
+            (Some(INITRD_ADDR), Some(INITRD_ADDR + initrd.len() as u64))
+        } else {
+            (None, None)
+        };
+
         Ok(KernelInfo {
             entry: KERNEL_ADDR,
             load_addr: KERNEL_ADDR,
             size: self.kernel_data.len() - setup_size,
             format: KernelFormat::BzImage,
+            initrd_start,
+            initrd_end,
         })
     }
 
@@ -298,6 +313,8 @@ impl LinuxLoader {
             load_addr: LOAD_ADDR,
             size: self.kernel_data.len(),
             format: KernelFormat::Raw,
+            initrd_start: None,
+            initrd_end: None,
         })
     }
 
