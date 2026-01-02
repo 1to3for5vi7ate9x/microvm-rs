@@ -542,6 +542,8 @@ fn run_vm_loop(
     let mut gic_dist_ctrl: u32 = 0;
     let mut gic_cpu_ctrl: u32 = 0;
     let mut gic_pmr: u32 = 0xFF;  // All priorities enabled
+    let mut virtio_irq_pending: bool = false;  // Track pending VirtIO interrupt
+    const VIRTIO_IRQ: u32 = 32 + 16;  // SPI 16 = IRQ 48
 
     // Create VirtIO console transport if enabled
     let mut virtio_transport = if enable_console {
@@ -581,6 +583,7 @@ fn run_vm_loop(
         }
 
         // Process VirtIO console RX (deliver input to guest)
+        let mut need_irq = false;
         if let Some(ref mut transport) = virtio_transport {
             if transport.device().has_pending_input() {
                 // Clone queue config from transport to device
@@ -590,7 +593,17 @@ fn run_vm_loop(
                 let memory = vm.memory_mut().as_mut_slice();
                 if transport.device_mut().process_rx(memory) {
                     transport.signal_interrupt();
+                    virtio_irq_pending = true;  // Set GIC pending flag
+                    need_irq = true;
                 }
+            }
+        }
+
+        // Inject IRQ to wake guest if we have pending VirtIO interrupt
+        if need_irq {
+            if let Some(vcpu) = vm.vcpu_mut(0) {
+                use microvm::backend::hvf::bindings::arm64_interrupt::HV_INTERRUPT_TYPE_IRQ;
+                let _ = vcpu.set_pending_interrupt(HV_INTERRUPT_TYPE_IRQ, true);
             }
         }
 
@@ -754,8 +767,13 @@ fn run_vm_loop(
                         GICC_CTLR => gic_cpu_ctrl as u64,
                         GICC_PMR => gic_pmr as u64,
                         GICC_IAR => {
-                            // No pending interrupt - return spurious interrupt ID (1023)
-                            1023
+                            // Return pending VirtIO interrupt or spurious (1023)
+                            if virtio_irq_pending {
+                                virtio_irq_pending = false;  // Auto-clear on read
+                                VIRTIO_IRQ as u64
+                            } else {
+                                1023  // Spurious interrupt
+                            }
                         }
                         _ => 0,
                     }
