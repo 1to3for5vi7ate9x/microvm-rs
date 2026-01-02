@@ -7,6 +7,21 @@ use std::sync::atomic::{fence, Ordering};
 /// Maximum queue size.
 pub const MAX_QUEUE_SIZE: u16 = 256;
 
+/// RAM base address - guest physical addresses start here.
+/// The memory slice passed to queue operations represents RAM starting at this address.
+pub const RAM_BASE: u64 = 0x4000_0000;
+
+/// Convert a guest physical address to a memory slice offset.
+/// Returns None if the address is below RAM_BASE.
+#[inline]
+pub fn gpa_to_offset(gpa: u64) -> Option<usize> {
+    if gpa >= RAM_BASE {
+        Some((gpa - RAM_BASE) as usize)
+    } else {
+        None
+    }
+}
+
 /// Virtqueue descriptor flags.
 pub mod desc_flags {
     /// This marks a buffer as continuing via the next field.
@@ -61,6 +76,7 @@ pub struct UsedRingEntry {
 }
 
 /// Virtqueue configuration and state.
+#[derive(Clone)]
 pub struct Queue {
     /// Queue size (number of descriptors).
     pub size: u16,
@@ -132,7 +148,8 @@ impl Queue {
 
         // Read the descriptor index from the available ring
         // Available ring layout: flags (u16), idx (u16), ring[size] (u16 each)
-        let avail_ring_offset = self.avail_ring as usize + 4 + ring_idx * 2;
+        let avail_ring_base = gpa_to_offset(self.avail_ring)?;
+        let avail_ring_offset = avail_ring_base + 4 + ring_idx * 2;
         if avail_ring_offset + 2 > memory.len() {
             return None;
         }
@@ -150,7 +167,8 @@ impl Queue {
 
     /// Read a descriptor from the descriptor table.
     pub fn read_descriptor(&self, memory: &[u8], index: u16) -> Option<Descriptor> {
-        let offset = self.desc_table as usize + (index as usize) * 16;
+        let desc_base = gpa_to_offset(self.desc_table)?;
+        let offset = desc_base + (index as usize) * 16;
         if offset + 16 > memory.len() {
             return None;
         }
@@ -173,7 +191,11 @@ impl Queue {
         let ring_idx = (self.next_used_idx % self.size) as usize;
 
         // Used ring layout: flags (u16), idx (u16), ring[size] (id u32, len u32 each)
-        let used_ring_offset = self.used_ring as usize + 4 + ring_idx * 8;
+        let used_ring_base = match gpa_to_offset(self.used_ring) {
+            Some(base) => base,
+            None => return,
+        };
+        let used_ring_offset = used_ring_base + 4 + ring_idx * 8;
         if used_ring_offset + 8 > memory.len() {
             return;
         }
@@ -191,7 +213,7 @@ impl Queue {
 
         // Update the used index
         self.next_used_idx = self.next_used_idx.wrapping_add(1);
-        let idx_offset = self.used_ring as usize + 2;
+        let idx_offset = used_ring_base + 2;
         if idx_offset + 2 <= memory.len() {
             memory[idx_offset..idx_offset + 2].copy_from_slice(&self.next_used_idx.to_le_bytes());
         }
@@ -199,7 +221,10 @@ impl Queue {
 
     /// Read the available ring index from memory.
     fn read_avail_idx(&self, memory: &[u8]) -> u16 {
-        let offset = self.avail_ring as usize + 2;
+        let offset = match gpa_to_offset(self.avail_ring) {
+            Some(base) => base + 2,
+            None => return self.last_avail_idx,
+        };
         if offset + 2 > memory.len() {
             return self.last_avail_idx;
         }

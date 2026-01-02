@@ -69,6 +69,16 @@ impl<D: VirtioDevice> VirtioMmioTransport<D> {
         &mut self.device
     }
 
+    /// Get a reference to a queue by index.
+    pub fn queue(&self, index: usize) -> Option<&Queue> {
+        self.queues.get(index)
+    }
+
+    /// Get the currently selected queue index.
+    pub fn queue_sel(&self) -> u32 {
+        self.queue_sel
+    }
+
     /// Get the current queue.
     fn current_queue(&self) -> Option<&Queue> {
         self.queues.get(self.queue_sel as usize)

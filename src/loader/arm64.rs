@@ -64,6 +64,13 @@ impl DeviceTreeBuilder {
     /// MMIO regions (GIC, UART) are below this address.
     pub const RAM_BASE: u64 = 0x4000_0000; // 1GB
 
+    /// VirtIO MMIO base address.
+    pub const VIRTIO_MMIO_BASE: u64 = 0x0a00_0000;
+    /// VirtIO MMIO size per device.
+    pub const VIRTIO_MMIO_SIZE: u64 = 0x200;
+    /// VirtIO console IRQ (SPI).
+    pub const VIRTIO_CONSOLE_IRQ: u32 = 16;
+
     /// Build a minimal device tree for Linux boot.
     pub fn build_minimal(
         memory_size: u64,
@@ -72,7 +79,18 @@ impl DeviceTreeBuilder {
         initrd_end: Option<u64>,
     ) -> Vec<u8> {
         let mut builder = Self::new();
-        builder.build(memory_size, cmdline, initrd_start, initrd_end)
+        builder.build(memory_size, cmdline, initrd_start, initrd_end, false)
+    }
+
+    /// Build a device tree with VirtIO console support.
+    pub fn build_with_console(
+        memory_size: u64,
+        cmdline: &str,
+        initrd_start: Option<u64>,
+        initrd_end: Option<u64>,
+    ) -> Vec<u8> {
+        let mut builder = Self::new();
+        builder.build(memory_size, cmdline, initrd_start, initrd_end, true)
     }
 
     fn build(
@@ -81,6 +99,7 @@ impl DeviceTreeBuilder {
         cmdline: &str,
         initrd_start: Option<u64>,
         initrd_end: Option<u64>,
+        with_console: bool,
     ) -> Vec<u8> {
         // Start with structure block
         self.begin_node("");
@@ -134,6 +153,20 @@ impl DeviceTreeBuilder {
         self.add_prop_u32("phandle", 1);
         self.end_node();
 
+        // Fixed clock for UART (defined before PL011 that references it)
+        self.begin_node("apb-pclk");
+        self.add_prop_string("compatible", "fixed-clock");
+        self.add_prop_u32("#clock-cells", 0);
+        self.add_prop_u32("clock-frequency", 24000000); // 24MHz
+        self.add_prop_string("clock-output-names", "clk24mhz");
+        self.add_prop_u32("phandle", 2);
+        self.end_node();
+
+        // Aliases for serial port
+        self.begin_node("aliases");
+        self.add_prop_string("serial0", "/pl011@9000000");
+        self.end_node();
+
         // PL011 UART
         self.begin_node("pl011@9000000");
         self.add_prop_string("compatible", "arm,pl011\0arm,primecell");
@@ -144,15 +177,8 @@ impl DeviceTreeBuilder {
         self.add_prop_string("clock-names", "uartclk\0apb_pclk");
         // Clocks - reference fixed clock
         self.add_prop_u32_pair("clocks", 2, 2); // phandle 2 for both clocks
-        self.end_node();
-
-        // Fixed clock for UART
-        self.begin_node("apb-pclk");
-        self.add_prop_string("compatible", "fixed-clock");
-        self.add_prop_u32("#clock-cells", 0);
-        self.add_prop_u32("clock-frequency", 24000000); // 24MHz
-        self.add_prop_string("clock-output-names", "clk24mhz");
-        self.add_prop_u32("phandle", 2);
+        self.add_prop_string("status", "okay");
+        self.add_prop_u32("phandle", 3); // Give uart a phandle too
         self.end_node();
 
         // PSCI node
@@ -169,6 +195,19 @@ impl DeviceTreeBuilder {
         self.add_prop_timer_interrupts();
         self.add_prop_u32("interrupt-parent", 1);
         self.end_node();
+
+        // VirtIO console (if enabled)
+        if with_console {
+            let virtio_addr = Self::VIRTIO_MMIO_BASE;
+            self.begin_node(&format!("virtio_mmio@{:x}", virtio_addr));
+            self.add_prop_string("compatible", "virtio,mmio");
+            self.add_prop_reg64(virtio_addr, Self::VIRTIO_MMIO_SIZE);
+            // Interrupt: SPI 16, level high
+            self.add_prop_interrupts(0, Self::VIRTIO_CONSOLE_IRQ, 4); // GIC_SPI, IRQ 16, level high
+            self.add_prop_u32("interrupt-parent", 1); // phandle of GIC
+            self.add_prop_empty("dma-coherent");
+            self.end_node();
+        }
 
         self.end_node(); // root
 
@@ -381,5 +420,23 @@ mod tests {
         // Should have reasonable size
         assert!(dtb.len() > 100);
         assert!(dtb.len() < 4096);
+    }
+
+    #[test]
+    fn test_build_dtb_with_console() {
+        let dtb = DeviceTreeBuilder::build_with_console(
+            256 * 1024 * 1024, // 256MB
+            "console=hvc0",
+            None,
+            None,
+        );
+
+        // Check FDT magic
+        let magic = u32::from_be_bytes([dtb[0], dtb[1], dtb[2], dtb[3]]);
+        assert_eq!(magic, 0xd00dfeed);
+
+        // Should have reasonable size (larger with virtio node)
+        assert!(dtb.len() > 100);
+        assert!(dtb.len() < 8192);
     }
 }

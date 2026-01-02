@@ -14,6 +14,7 @@ pub use queue::{Queue, Descriptor, DescriptorChain};
 pub use mmio_transport::{VirtioMmioTransport, VIRTIO_MMIO_SIZE};
 pub use blk::VirtioBlk;
 pub use net::VirtioNet;
+pub use console::VirtioConsole;
 
 /// Virtio MMIO register offsets.
 pub mod mmio {

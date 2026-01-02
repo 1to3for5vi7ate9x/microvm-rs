@@ -35,8 +35,15 @@ guest/
 linux-*.tar.xz
 linux-*/
 
-# Code signing
+# Code signing (keep microvm.entitlements, ignore others)
 entitlements.plist
+
+# Initramfs build directory (contains large binaries)
+initramfs/
+
+# Temporary files
+/tmp/
+*.dtb
 
 # Coverage
 *.profraw
