@@ -4,7 +4,5 @@
 <dict>
     <key>com.apple.security.hypervisor</key>
     <true/>
-    <!-- com.apple.vm.networking removed - causes SIGKILL with ad-hoc signing -->
-    <!-- vmnet backend is disabled for now, will need proper code signing to enable -->
 </dict>
 </plist>
