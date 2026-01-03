@@ -9,7 +9,10 @@ pub mod net;
 pub mod vsock;
 pub mod blk;
 pub mod console;
-pub mod vmnet;
+// vmnet disabled - causes binary to link vmnet.framework which requires
+// com.apple.vm.networking entitlement. Ad-hoc signed binaries get SIGKILL
+// when this entitlement is present. Needs proper code signing to enable.
+// pub mod vmnet;
 
 pub use queue::{Queue, Descriptor, DescriptorChain};
 pub use mmio_transport::{VirtioMmioTransport, VIRTIO_MMIO_SIZE};
@@ -17,7 +20,7 @@ pub use blk::VirtioBlk;
 pub use net::{VirtioNet, NetBackend, NullBackend, LoopbackBackend};
 pub use console::VirtioConsole;
 pub use vsock::VirtioVsock;
-pub use vmnet::{VmnetBackend, VmnetMode};
+// pub use vmnet::{VmnetBackend, VmnetMode};
 
 /// Virtio MMIO register offsets.
 pub mod mmio {

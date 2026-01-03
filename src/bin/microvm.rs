@@ -11,7 +11,7 @@ use microvm::backend::VmConfig;
 #[cfg(target_arch = "aarch64")]
 use microvm::backend::hvf::{bindings::arm64_reg, Vm, VcpuExit};
 #[cfg(target_arch = "aarch64")]
-use microvm::device::virtio::{VirtioBlk, VirtioConsole, VirtioMmioTransport, VirtioVsock, VirtioNet, VmnetBackend};
+use microvm::device::virtio::{VirtioBlk, VirtioConsole, VirtioMmioTransport, VirtioVsock, VirtioNet, NullBackend};
 
 #[cfg(target_arch = "x86_64")]
 use microvm::backend::hvf::{Vm, VcpuExit};
@@ -69,7 +69,7 @@ RUN OPTIONS:
     --cpus <N>          Number of vCPUs (default: 1)
     --disk <PATH>       Path to disk image (virtio-blk)
     --console           Enable VirtIO console for interactive shell
-    --net               Enable VirtIO network with vmnet backend (macOS)
+    --net               Enable VirtIO network (null backend, vmnet disabled)
 
 EXAMPLES:
     {} run --kernel vmlinuz --initrd initrd.img --memory 1024
@@ -222,7 +222,7 @@ fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         println!("Console: VirtIO console (hvc0)");
     }
     if enable_net {
-        println!("Network: VirtIO net (vmnet backend)");
+        println!("Network: VirtIO net (null backend - vmnet disabled)");
     }
     if !cmdline.is_empty() {
         println!("Cmdline: {}", cmdline);
@@ -595,21 +595,13 @@ fn run_vm_loop(
     println!("Vsock: CID {} at 0x{:x}", GUEST_CID, VIRTIO_VSOCK_BASE);
 
     // Create VirtIO network device if enabled
+    // Note: vmnet backend is disabled due to entitlement issues with ad-hoc signing.
+    // Using NullBackend as a placeholder until proper code signing is implemented.
     let mut virtio_net = if enable_net {
-        match VmnetBackend::new() {
-            Ok(backend) => {
-                let mac = *backend.mac_address();  // Copy the MAC before moving
-                let net = VirtioNet::with_backend(Box::new(backend));
-                println!("Network: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} at 0x{:x}",
-                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], VIRTIO_NET_BASE);
-                Some(VirtioMmioTransport::new(net, VIRTIO_NET_BASE))
-            }
-            Err(e) => {
-                eprintln!("Warning: Failed to create vmnet backend: {}", e);
-                eprintln!("Note: vmnet requires the com.apple.vm.networking entitlement");
-                None
-            }
-        }
+        let backend = NullBackend;
+        let net = VirtioNet::with_backend(Box::new(backend));
+        println!("Network: at 0x{:x} (null backend - vmnet disabled)", VIRTIO_NET_BASE);
+        Some(VirtioMmioTransport::new(net, VIRTIO_NET_BASE))
     } else {
         None
     };
