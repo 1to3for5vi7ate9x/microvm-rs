@@ -3,11 +3,13 @@ name = "microvm"
 version = "0.1.0"
 edition = "2021"
 authors = ["Ankit Choudhary"]
-description = "Cross-platform, embeddable microVM library"
+description = "Cross-platform, embeddable microVM library for Rust. Spawn lightweight VMs using native hypervisors (HVF, WHP, KVM)."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/anthropics/microvm-rs"
+repository = "https://github.com/ArkProjectNFTs/microvm-rs"
+readme = "README.md"
 keywords = ["virtualization", "hypervisor", "microvm", "kvm", "hvf"]
 categories = ["virtualization", "os"]
+rust-version = "1.70"
 
 [features]
 default = []
