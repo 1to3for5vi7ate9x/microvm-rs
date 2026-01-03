@@ -11,7 +11,7 @@ use microvm::backend::VmConfig;
 #[cfg(target_arch = "aarch64")]
 use microvm::backend::hvf::{bindings::arm64_reg, Vm, VcpuExit};
 #[cfg(target_arch = "aarch64")]
-use microvm::device::virtio::{VirtioConsole, VirtioMmioTransport};
+use microvm::device::virtio::{VirtioBlk, VirtioConsole, VirtioMmioTransport, VirtioVsock, VirtioNet, VmnetBackend};
 
 #[cfg(target_arch = "x86_64")]
 use microvm::backend::hvf::{Vm, VcpuExit};
@@ -69,12 +69,14 @@ RUN OPTIONS:
     --cpus <N>          Number of vCPUs (default: 1)
     --disk <PATH>       Path to disk image (virtio-blk)
     --console           Enable VirtIO console for interactive shell
+    --net               Enable VirtIO network with vmnet backend (macOS)
 
 EXAMPLES:
     {} run --kernel vmlinuz --initrd initrd.img --memory 1024
     {} run --kernel Image --cmdline "console=hvc0" --console
+    {} run --kernel Image --net --console
 "#,
-        program, program, program
+        program, program, program, program
     );
 }
 
@@ -133,6 +135,7 @@ fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut cpus = 1u32;
     let mut disk_path: Option<PathBuf> = None;
     let mut enable_console = false;
+    let mut enable_net = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -182,6 +185,9 @@ fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--console" => {
                 enable_console = true;
             }
+            "--net" | "--network" => {
+                enable_net = true;
+            }
             _ => {
                 // Assume it's the kernel path if no flag
                 if kernel_path.is_none() {
@@ -214,6 +220,9 @@ fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     println!("vCPUs: {}", cpus);
     if enable_console {
         println!("Console: VirtIO console (hvc0)");
+    }
+    if enable_net {
+        println!("Network: VirtIO net (vmnet backend)");
     }
     if !cmdline.is_empty() {
         println!("Cmdline: {}", cmdline);
@@ -252,7 +261,7 @@ fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         vcpus: cpus,
         kernel: Some(kernel_path),
         initrd: initrd_path,
-        rootfs: disk_path,
+        rootfs: disk_path.clone(),
         cmdline: cmdline.clone(),
     };
 
@@ -266,23 +275,20 @@ fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(target_arch = "aarch64")]
     {
-        // Build device tree with initrd addresses
+        // Build device tree with initrd addresses and VirtIO devices
         let memory_size = (memory_mb as u64) * 1024 * 1024;
-        let dtb = if enable_console {
-            microvm::loader::arm64::DeviceTreeBuilder::build_with_console(
-                memory_size,
-                loader.cmdline(),
-                kernel_info.initrd_start,
-                kernel_info.initrd_end,
-            )
-        } else {
-            microvm::loader::arm64::DeviceTreeBuilder::build_minimal(
-                memory_size,
-                loader.cmdline(),
-                kernel_info.initrd_start,
-                kernel_info.initrd_end,
-            )
-        };
+        let has_block = disk_path.is_some();
+        let has_vsock = true;  // vsock always enabled for host-guest communication
+        let dtb = microvm::loader::arm64::DeviceTreeBuilder::build_with_devices(
+            memory_size,
+            loader.cmdline(),
+            kernel_info.initrd_start,
+            kernel_info.initrd_end,
+            enable_console,
+            has_block,
+            has_vsock,
+            enable_net,
+        );
 
         if let (Some(start), Some(end)) = (kernel_info.initrd_start, kernel_info.initrd_end) {
             println!("  Initrd: 0x{:x} - 0x{:x} ({} bytes)", start, end, end - start);
@@ -319,7 +325,7 @@ fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Run VM loop
-    run_vm_loop(&mut vm, enable_console)?;
+    run_vm_loop(&mut vm, enable_console, enable_net, disk_path)?;
 
     println!("\nVM stopped.");
     Ok(())
@@ -501,13 +507,18 @@ fn handle_psci_call(function_id: u64) -> u64 {
 fn run_vm_loop(
     vm: &mut Vm,
     enable_console: bool,
+    enable_net: bool,
+    disk_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use microvm::backend::hvf::bindings::{arm64_reg, arm64_sys_reg};
     use microvm::device::virtio::mmio;
 
     const RAM_BASE: u64 = 0x4000_0000;
     const UART_BASE: u64 = 0x0900_0000;
-    const VIRTIO_BASE: u64 = 0x0a00_0000;
+    const VIRTIO_CONSOLE_BASE: u64 = 0x0a00_0000;
+    const VIRTIO_BLK_BASE: u64 = 0x0a00_0200;  // Next VirtIO device slot
+    const VIRTIO_VSOCK_BASE: u64 = 0x0a00_0400;  // Next VirtIO device slot
+    const VIRTIO_NET_BASE: u64 = 0x0a00_0600;   // Network device slot
     const VIRTIO_SIZE: u64 = 0x200;
 
     // GIC (Generic Interrupt Controller) addresses
@@ -542,12 +553,63 @@ fn run_vm_loop(
     let mut gic_dist_ctrl: u32 = 0;
     let mut gic_cpu_ctrl: u32 = 0;
     let mut gic_pmr: u32 = 0xFF;  // All priorities enabled
+
+    // Pending interrupt tracking
     let mut virtio_irq_pending: bool = false;  // Track pending VirtIO interrupt
+    let mut timer_irq_pending: bool = false;   // Track pending timer interrupt
     const VIRTIO_IRQ: u32 = 32 + 16;  // SPI 16 = IRQ 48
+    const VTIMER_IRQ: u32 = 16 + 11;  // PPI 11 = IRQ 27 (virtual timer)
 
     // Create VirtIO console transport if enabled
-    let mut virtio_transport = if enable_console {
-        Some(VirtioMmioTransport::new(VirtioConsole::new(), VIRTIO_BASE))
+    let mut virtio_console = if enable_console {
+        Some(VirtioMmioTransport::new(VirtioConsole::new(), VIRTIO_CONSOLE_BASE))
+    } else {
+        None
+    };
+
+    // Create VirtIO block transport if disk is specified
+    let mut virtio_blk = if let Some(ref path) = disk_path {
+        match VirtioBlk::from_file(path) {
+            Ok(blk) => {
+                println!("Block device: {} ({} bytes)", path.display(), blk.capacity());
+                Some(VirtioMmioTransport::new(blk, VIRTIO_BLK_BASE))
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to open disk image: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut blk_irq_pending: bool = false;  // Track pending block interrupt
+    let mut vsock_irq_pending: bool = false;  // Track pending vsock interrupt
+    let mut net_irq_pending: bool = false;   // Track pending network interrupt
+    const BLK_IRQ: u32 = 32 + 17;  // SPI 17 = IRQ 49
+    const VSOCK_IRQ: u32 = 32 + 18;  // SPI 18 = IRQ 50
+    const NET_IRQ: u32 = 32 + 19;  // SPI 19 = IRQ 51
+
+    // Create VirtIO vsock device (always enabled for host-guest communication)
+    const GUEST_CID: u64 = 3;  // Guest CID (first available after host=2)
+    let mut virtio_vsock = Some(VirtioMmioTransport::new(VirtioVsock::new(GUEST_CID), VIRTIO_VSOCK_BASE));
+    println!("Vsock: CID {} at 0x{:x}", GUEST_CID, VIRTIO_VSOCK_BASE);
+
+    // Create VirtIO network device if enabled
+    let mut virtio_net = if enable_net {
+        match VmnetBackend::new() {
+            Ok(backend) => {
+                let mac = *backend.mac_address();  // Copy the MAC before moving
+                let net = VirtioNet::with_backend(Box::new(backend));
+                println!("Network: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} at 0x{:x}",
+                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], VIRTIO_NET_BASE);
+                Some(VirtioMmioTransport::new(net, VIRTIO_NET_BASE))
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to create vmnet backend: {}", e);
+                eprintln!("Note: vmnet requires the com.apple.vm.networking entitlement");
+                None
+            }
+        }
     } else {
         None
     };
@@ -576,7 +638,7 @@ fn run_vm_loop(
         // Check for stdin input if console is enabled
         if stdin_enabled {
             if let Some(input) = read_stdin_nonblocking() {
-                if let Some(ref mut transport) = virtio_transport {
+                if let Some(ref mut transport) = virtio_console {
                     transport.device_mut().queue_input(&input);
                 }
             }
@@ -584,7 +646,7 @@ fn run_vm_loop(
 
         // Process VirtIO console RX (deliver input to guest)
         let mut need_irq = false;
-        if let Some(ref mut transport) = virtio_transport {
+        if let Some(ref mut transport) = virtio_console {
             if transport.device().has_pending_input() {
                 // Clone queue config from transport to device
                 if let Some(rx_queue) = transport.queue(0).cloned() {
@@ -627,10 +689,10 @@ fn run_vm_loop(
                     (value, pc)
                 };
 
-                // Handle VirtIO MMIO writes
-                if addr >= VIRTIO_BASE && addr < VIRTIO_BASE + VIRTIO_SIZE {
-                    if let Some(ref mut transport) = virtio_transport {
-                        let offset = addr - VIRTIO_BASE;
+                // Handle VirtIO Console MMIO writes
+                if addr >= VIRTIO_CONSOLE_BASE && addr < VIRTIO_CONSOLE_BASE + VIRTIO_SIZE {
+                    if let Some(ref mut transport) = virtio_console {
+                        let offset = addr - VIRTIO_CONSOLE_BASE;
 
                         transport.write(addr, value);
 
@@ -665,6 +727,118 @@ fn run_vm_loop(
                                     let _ = std::io::stdout().flush();
                                     transport.signal_interrupt();
                                 }
+                            }
+                        }
+                    }
+                }
+                // Handle VirtIO Block MMIO writes
+                else if addr >= VIRTIO_BLK_BASE && addr < VIRTIO_BLK_BASE + VIRTIO_SIZE {
+                    if let Some(ref mut transport) = virtio_blk {
+                        let offset = addr - VIRTIO_BLK_BASE;
+
+                        transport.write(addr, value);
+
+                        // Handle queue notify - process block requests
+                        if offset == mmio::QUEUE_NOTIFY as u64 {
+                            // Clone queue config first to avoid borrow conflict
+                            let queue_config = transport.queue(0).cloned();
+
+                            // Sync queue config from transport to device
+                            if let Some(queue) = queue_config {
+                                let dev_queue = transport.device_mut().queue_mut();
+                                dev_queue.desc_table = queue.desc_table;
+                                dev_queue.avail_ring = queue.avail_ring;
+                                dev_queue.used_ring = queue.used_ring;
+                                dev_queue.size = queue.size;
+                                dev_queue.ready = queue.ready;
+                            }
+                            // Process all pending block requests
+                            let memory = vm.memory_mut().as_mut_slice();
+                            if transport.device_mut().process_queue(memory) {
+                                transport.signal_interrupt();
+                                blk_irq_pending = true;
+                            }
+                        }
+                    }
+                }
+                // Handle VirtIO Vsock MMIO writes
+                else if addr >= VIRTIO_VSOCK_BASE && addr < VIRTIO_VSOCK_BASE + VIRTIO_SIZE {
+                    if let Some(ref mut transport) = virtio_vsock {
+                        let offset = addr - VIRTIO_VSOCK_BASE;
+
+                        transport.write(addr, value);
+
+                        // Handle queue notify
+                        if offset == mmio::QUEUE_NOTIFY as u64 {
+                            let notified_queue = value;
+
+                            // Clone queue configs first to avoid borrow conflict
+                            let rx_queue_config = transport.queue(0).cloned();
+                            let tx_queue_config = transport.queue(1).cloned();
+                            let event_queue_config = transport.queue(2).cloned();
+
+                            // Sync queue configs from transport to device
+                            if let Some(queue) = rx_queue_config {
+                                transport.device_mut().sync_rx_queue(&queue);
+                            }
+                            if let Some(queue) = tx_queue_config {
+                                transport.device_mut().sync_tx_queue(&queue);
+                            }
+                            if let Some(queue) = event_queue_config {
+                                transport.device_mut().sync_event_queue(&queue);
+                            }
+
+                            // Process RX queue (queue 0) - send pending packets to guest
+                            if notified_queue == 0 {
+                                if transport.device().has_rx_data() {
+                                    let memory = vm.memory_mut().as_mut_slice();
+                                    if transport.device_mut().process_rx(memory) {
+                                        transport.signal_interrupt();
+                                        vsock_irq_pending = true;
+                                    }
+                                }
+                            }
+
+                            // Process TX queue (queue 1) - receive packets from guest
+                            if notified_queue == 1 {
+                                let memory = vm.memory_mut().as_mut_slice();
+                                let packets = transport.device_mut().process_tx(memory);
+                                if !packets.is_empty() {
+                                    // Packets received from guest - could process here
+                                    // For now, just signal interrupt
+                                    transport.signal_interrupt();
+                                    vsock_irq_pending = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                // Handle VirtIO Network MMIO writes
+                else if addr >= VIRTIO_NET_BASE && addr < VIRTIO_NET_BASE + VIRTIO_SIZE {
+                    if let Some(ref mut transport) = virtio_net {
+                        let offset = addr - VIRTIO_NET_BASE;
+
+                        transport.write(addr, value);
+
+                        // Handle queue notify
+                        if offset == mmio::QUEUE_NOTIFY as u64 {
+                            let notified_queue = value;
+
+                            // RX queue (queue 0) - send pending packets to guest
+                            if notified_queue == 0 {
+                                if transport.device().has_rx_data() {
+                                    let memory = vm.memory_mut().as_mut_slice();
+                                    // TODO: Implement proper RX processing
+                                    transport.signal_interrupt();
+                                    net_irq_pending = true;
+                                }
+                            }
+
+                            // TX queue (queue 1) - receive packets from guest
+                            if notified_queue == 1 {
+                                // TODO: Implement proper TX processing
+                                transport.signal_interrupt();
+                                net_irq_pending = true;
                             }
                         }
                     }
@@ -709,7 +883,13 @@ fn run_vm_loop(
                             gic_pmr = value;
                         }
                         GICC_EOIR => {
-                            // End of interrupt - acknowledge
+                            // End of interrupt - unmask timer if it was the timer IRQ
+                            if value == VTIMER_IRQ {
+                                // Unmask the vtimer so we can get the next timer interrupt
+                                if let Some(vcpu) = vm.vcpu_mut(0) {
+                                    let _ = vcpu.set_vtimer_mask(false);
+                                }
+                            }
                         }
                         _ => {
                             // Accept all other GIC CPU interface writes
@@ -722,11 +902,36 @@ fn run_vm_loop(
                 vcpu.write_register(arm64_reg::HV_REG_PC, pc + 4)?;
             }
             VcpuExit::MmioRead { addr, syndrome, .. } => {
-                let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
+                // Track if we need to reassert IRQ after handling this read
+                let mut reassert_irq = false;
 
-                // Handle VirtIO MMIO reads
-                let value = if addr >= VIRTIO_BASE && addr < VIRTIO_BASE + VIRTIO_SIZE {
-                    if let Some(ref transport) = virtio_transport {
+                // Handle VirtIO Console MMIO reads
+                let value = if addr >= VIRTIO_CONSOLE_BASE && addr < VIRTIO_CONSOLE_BASE + VIRTIO_SIZE {
+                    if let Some(ref transport) = virtio_console {
+                        transport.read(addr) as u64
+                    } else {
+                        0
+                    }
+                }
+                // Handle VirtIO Block MMIO reads
+                else if addr >= VIRTIO_BLK_BASE && addr < VIRTIO_BLK_BASE + VIRTIO_SIZE {
+                    if let Some(ref transport) = virtio_blk {
+                        transport.read(addr) as u64
+                    } else {
+                        0
+                    }
+                }
+                // Handle VirtIO Vsock MMIO reads
+                else if addr >= VIRTIO_VSOCK_BASE && addr < VIRTIO_VSOCK_BASE + VIRTIO_SIZE {
+                    if let Some(ref transport) = virtio_vsock {
+                        transport.read(addr) as u64
+                    } else {
+                        0
+                    }
+                }
+                // Handle VirtIO Network MMIO reads
+                else if addr >= VIRTIO_NET_BASE && addr < VIRTIO_NET_BASE + VIRTIO_SIZE {
+                    if let Some(ref transport) = virtio_net {
                         transport.read(addr) as u64
                     } else {
                         0
@@ -767,19 +972,48 @@ fn run_vm_loop(
                         GICC_CTLR => gic_cpu_ctrl as u64,
                         GICC_PMR => gic_pmr as u64,
                         GICC_IAR => {
-                            // Return pending VirtIO interrupt or spurious (1023)
-                            if virtio_irq_pending {
-                                virtio_irq_pending = false;  // Auto-clear on read
-                                VIRTIO_IRQ as u64
+                            // Return highest priority pending interrupt
+                            // Priority: timer > console > block > vsock
+                            let irq = if timer_irq_pending {
+                                timer_irq_pending = false;  // Clear on acknowledge
+                                VTIMER_IRQ
+                            } else if virtio_irq_pending {
+                                virtio_irq_pending = false;  // Clear on acknowledge
+                                VIRTIO_IRQ
+                            } else if blk_irq_pending {
+                                blk_irq_pending = false;  // Clear on acknowledge
+                                BLK_IRQ
+                            } else if vsock_irq_pending {
+                                vsock_irq_pending = false;  // Clear on acknowledge
+                                VSOCK_IRQ
+                            } else if net_irq_pending {
+                                net_irq_pending = false;  // Clear on acknowledge
+                                NET_IRQ
                             } else {
                                 1023  // Spurious interrupt
+                            };
+
+                            // If there are still pending interrupts, keep IRQ asserted
+                            if timer_irq_pending || virtio_irq_pending || blk_irq_pending || vsock_irq_pending || net_irq_pending {
+                                reassert_irq = true;
                             }
+
+                            irq as u64
                         }
                         _ => 0,
                     }
                 } else {
                     0
                 };
+
+                // Now we can safely borrow vcpu
+                let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
+
+                // Reassert IRQ if there are still pending interrupts
+                if reassert_irq {
+                    use microvm::backend::hvf::bindings::arm64_interrupt::HV_INTERRUPT_TYPE_IRQ;
+                    let _ = vcpu.set_pending_interrupt(HV_INTERRUPT_TYPE_IRQ, true);
+                }
 
                 let srt = ((syndrome >> 16) & 0x1f) as u32;
                 if srt < 31 {
@@ -846,11 +1080,19 @@ fn run_vm_loop(
                 }
             }
             VcpuExit::Wfi => {
-                std::thread::sleep(std::time::Duration::from_micros(100));
+                // Only sleep if no interrupts pending - otherwise wake immediately
+                if !timer_irq_pending && !virtio_irq_pending && !blk_irq_pending && !vsock_irq_pending && !net_irq_pending {
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
             }
             VcpuExit::VTimer => {
+                // Timer fired - inject IRQ to guest and mask until acknowledged
+                timer_irq_pending = true;
                 let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
-                vcpu.set_vtimer_mask(true)?;
+                vcpu.set_vtimer_mask(true)?;  // Mask timer until guest acknowledges
+                // Inject IRQ to wake the guest
+                use microvm::backend::hvf::bindings::arm64_interrupt::HV_INTERRUPT_TYPE_IRQ;
+                vcpu.set_pending_interrupt(HV_INTERRUPT_TYPE_IRQ, true)?;
             }
             VcpuExit::SystemRegAccess { is_write, rt, .. } => {
                 // Handle system register access - skip the instruction

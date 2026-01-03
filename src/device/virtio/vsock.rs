@@ -25,6 +25,10 @@ use crate::device::VirtioDevice;
 use crate::error::Result;
 use std::collections::{HashMap, VecDeque};
 
+use super::queue::Queue;
+
+const QUEUE_SIZE: u16 = 128;
+
 /// Well-known CID values.
 pub mod cid {
     pub const HYPERVISOR: u64 = 0;
@@ -137,10 +141,18 @@ pub struct VirtioVsock {
     connections: HashMap<ConnKey, VsockConnection>,
     /// Pending incoming connection requests (port -> callback)
     listeners: HashMap<u32, bool>,
-    /// Pending packets to send to guest
-    rx_queue: VecDeque<Vec<u8>>,
+    /// Pending packets to send to guest (host->guest)
+    rx_pending: VecDeque<Vec<u8>>,
     /// Is the device activated?
     activated: bool,
+    /// RX virtqueue (host->guest)
+    rx_queue: Queue,
+    /// TX virtqueue (guest->host)
+    tx_queue: Queue,
+    /// Event virtqueue
+    event_queue: Queue,
+    /// Interrupt status
+    interrupt_status: u32,
 }
 
 impl VirtioVsock {
@@ -159,8 +171,12 @@ impl VirtioVsock {
             acked_features: 0,
             connections: HashMap::new(),
             listeners: HashMap::new(),
-            rx_queue: VecDeque::new(),
+            rx_pending: VecDeque::new(),
             activated: false,
+            rx_queue: Queue::new(QUEUE_SIZE),
+            tx_queue: Queue::new(QUEUE_SIZE),
+            event_queue: Queue::new(QUEUE_SIZE),
+            interrupt_status: 0,
         }
     }
 
@@ -202,7 +218,7 @@ impl VirtioVsock {
             pkt_type::STREAM,
             op::REQUEST,
         );
-        self.rx_queue.push_back(pkt);
+        self.rx_pending.push_back(pkt);
 
         Ok(())
     }
@@ -270,7 +286,7 @@ impl VirtioVsock {
                 pkt_type::STREAM,
                 op::SHUTDOWN,
             );
-            self.rx_queue.push_back(pkt);
+            self.rx_pending.push_back(pkt);
         }
     }
 
@@ -317,7 +333,7 @@ impl VirtioVsock {
                         pkt_type::STREAM,
                         op::RESPONSE,
                     );
-                    self.rx_queue.push_back(pkt);
+                    self.rx_pending.push_back(pkt);
                 }
             }
             op::RESPONSE => {
@@ -345,12 +361,120 @@ impl VirtioVsock {
 
     /// Get the next packet to send to the guest.
     pub fn get_rx_packet(&mut self) -> Option<Vec<u8>> {
-        self.rx_queue.pop_front()
+        self.rx_pending.pop_front()
     }
 
     /// Check if there are packets waiting for the guest.
     pub fn has_rx_data(&self) -> bool {
-        !self.rx_queue.is_empty()
+        !self.rx_pending.is_empty()
+    }
+
+    /// Sync RX queue configuration from transport.
+    pub fn sync_rx_queue(&mut self, queue: &Queue) {
+        self.rx_queue.desc_table = queue.desc_table;
+        self.rx_queue.avail_ring = queue.avail_ring;
+        self.rx_queue.used_ring = queue.used_ring;
+        self.rx_queue.size = queue.size;
+        self.rx_queue.ready = queue.ready;
+    }
+
+    /// Sync TX queue configuration from transport.
+    pub fn sync_tx_queue(&mut self, queue: &Queue) {
+        self.tx_queue.desc_table = queue.desc_table;
+        self.tx_queue.avail_ring = queue.avail_ring;
+        self.tx_queue.used_ring = queue.used_ring;
+        self.tx_queue.size = queue.size;
+        self.tx_queue.ready = queue.ready;
+    }
+
+    /// Sync event queue configuration from transport.
+    pub fn sync_event_queue(&mut self, queue: &Queue) {
+        self.event_queue.desc_table = queue.desc_table;
+        self.event_queue.avail_ring = queue.avail_ring;
+        self.event_queue.used_ring = queue.used_ring;
+        self.event_queue.size = queue.size;
+        self.event_queue.ready = queue.ready;
+    }
+
+    /// Get interrupt status.
+    pub fn interrupt_status(&self) -> u32 {
+        self.interrupt_status
+    }
+
+    /// Acknowledge interrupt.
+    pub fn ack_interrupt(&mut self, value: u32) {
+        self.interrupt_status &= !value;
+    }
+
+    /// Process RX queue - send pending packets to guest.
+    /// Returns true if any packets were delivered.
+    pub fn process_rx(&mut self, memory: &mut [u8]) -> bool {
+        let mut delivered = false;
+
+        while let Some(pkt) = self.rx_pending.front() {
+            // Get an available buffer from the guest
+            if let Some((head_idx, desc)) = self.rx_queue.pop_available(memory) {
+                if !desc.is_write_only() || (desc.len as usize) < pkt.len() {
+                    // Buffer not suitable, skip
+                    self.rx_queue.add_used(memory, head_idx, 0);
+                    continue;
+                }
+
+                // Write packet to guest buffer
+                let offset = super::queue::gpa_to_offset(desc.addr);
+                if let Some(offset) = offset {
+                    if offset + pkt.len() <= memory.len() {
+                        memory[offset..offset + pkt.len()].copy_from_slice(pkt);
+                        self.rx_queue.add_used(memory, head_idx, pkt.len() as u32);
+                        self.rx_pending.pop_front();
+                        delivered = true;
+                    }
+                }
+            } else {
+                // No more available buffers
+                break;
+            }
+        }
+
+        if delivered {
+            self.interrupt_status |= 1;
+        }
+        delivered
+    }
+
+    /// Process TX queue - receive packets from guest.
+    /// Returns any data that was received from the guest (for host to process).
+    pub fn process_tx(&mut self, memory: &mut [u8]) -> Vec<Vec<u8>> {
+        let mut received = Vec::new();
+
+        while let Some((head_idx, first_desc)) = self.tx_queue.pop_available(memory) {
+            if first_desc.is_write_only() {
+                // TX descriptors should be readable
+                self.tx_queue.add_used(memory, head_idx, 0);
+                continue;
+            }
+
+            // Read packet from guest buffer
+            let offset = super::queue::gpa_to_offset(first_desc.addr);
+            if let Some(offset) = offset {
+                let len = first_desc.len as usize;
+                if offset + len <= memory.len() {
+                    let mut pkt = vec![0u8; len];
+                    pkt.copy_from_slice(&memory[offset..offset + len]);
+
+                    // Process the packet (connection handling, etc.)
+                    self.process_tx_packet(&pkt);
+                    received.push(pkt);
+
+                    self.tx_queue.add_used(memory, head_idx, 0);
+                }
+            }
+        }
+
+        if !received.is_empty() {
+            self.interrupt_status |= 1;
+        }
+        received
     }
 
     /// Helper to write a vsock header.
@@ -414,7 +538,11 @@ impl VirtioDevice for VirtioVsock {
         self.acked_features = 0;
         self.activated = false;
         self.connections.clear();
-        self.rx_queue.clear();
+        self.rx_pending.clear();
+        self.rx_queue.reset();
+        self.tx_queue.reset();
+        self.event_queue.reset();
+        self.interrupt_status = 0;
     }
 }
 

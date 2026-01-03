@@ -9,12 +9,15 @@ pub mod net;
 pub mod vsock;
 pub mod blk;
 pub mod console;
+pub mod vmnet;
 
 pub use queue::{Queue, Descriptor, DescriptorChain};
 pub use mmio_transport::{VirtioMmioTransport, VIRTIO_MMIO_SIZE};
 pub use blk::VirtioBlk;
-pub use net::VirtioNet;
+pub use net::{VirtioNet, NetBackend, NullBackend, LoopbackBackend};
 pub use console::VirtioConsole;
+pub use vsock::VirtioVsock;
+pub use vmnet::{VmnetBackend, VmnetMode};
 
 /// Virtio MMIO register offsets.
 pub mod mmio {

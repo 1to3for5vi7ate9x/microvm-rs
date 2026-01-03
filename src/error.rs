@@ -81,6 +81,13 @@ pub enum Error {
     #[cfg(target_os = "linux")]
     #[error("KVM error: {0}")]
     KvmError(String),
+
+    // Network errors
+    #[error("vmnet error: {0}")]
+    Vmnet(String),
+
+    #[error("feature not supported: {0}")]
+    NotSupported(String),
 }
 
 impl Error {

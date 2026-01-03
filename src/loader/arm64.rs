@@ -70,6 +70,12 @@ impl DeviceTreeBuilder {
     pub const VIRTIO_MMIO_SIZE: u64 = 0x200;
     /// VirtIO console IRQ (SPI).
     pub const VIRTIO_CONSOLE_IRQ: u32 = 16;
+    /// VirtIO block IRQ (SPI).
+    pub const VIRTIO_BLK_IRQ: u32 = 17;
+    /// VirtIO vsock IRQ (SPI).
+    pub const VIRTIO_VSOCK_IRQ: u32 = 18;
+    /// VirtIO network IRQ (SPI).
+    pub const VIRTIO_NET_IRQ: u32 = 19;
 
     /// Build a minimal device tree for Linux boot.
     pub fn build_minimal(
@@ -79,7 +85,7 @@ impl DeviceTreeBuilder {
         initrd_end: Option<u64>,
     ) -> Vec<u8> {
         let mut builder = Self::new();
-        builder.build(memory_size, cmdline, initrd_start, initrd_end, false)
+        builder.build_internal(memory_size, cmdline, initrd_start, initrd_end, &[])
     }
 
     /// Build a device tree with VirtIO console support.
@@ -90,16 +96,45 @@ impl DeviceTreeBuilder {
         initrd_end: Option<u64>,
     ) -> Vec<u8> {
         let mut builder = Self::new();
-        builder.build(memory_size, cmdline, initrd_start, initrd_end, true)
+        let devices = [(Self::VIRTIO_MMIO_BASE, Self::VIRTIO_CONSOLE_IRQ)];
+        builder.build_internal(memory_size, cmdline, initrd_start, initrd_end, &devices)
     }
 
-    fn build(
+    /// Build a device tree with VirtIO device support.
+    pub fn build_with_devices(
+        memory_size: u64,
+        cmdline: &str,
+        initrd_start: Option<u64>,
+        initrd_end: Option<u64>,
+        has_console: bool,
+        has_block: bool,
+        has_vsock: bool,
+        has_net: bool,
+    ) -> Vec<u8> {
+        let mut builder = Self::new();
+        let mut devices = Vec::new();
+        if has_console {
+            devices.push((Self::VIRTIO_MMIO_BASE, Self::VIRTIO_CONSOLE_IRQ));
+        }
+        if has_block {
+            devices.push((Self::VIRTIO_MMIO_BASE + Self::VIRTIO_MMIO_SIZE, Self::VIRTIO_BLK_IRQ));
+        }
+        if has_vsock {
+            devices.push((Self::VIRTIO_MMIO_BASE + 2 * Self::VIRTIO_MMIO_SIZE, Self::VIRTIO_VSOCK_IRQ));
+        }
+        if has_net {
+            devices.push((Self::VIRTIO_MMIO_BASE + 3 * Self::VIRTIO_MMIO_SIZE, Self::VIRTIO_NET_IRQ));
+        }
+        builder.build_internal(memory_size, cmdline, initrd_start, initrd_end, &devices)
+    }
+
+    fn build_internal(
         &mut self,
         memory_size: u64,
         cmdline: &str,
         initrd_start: Option<u64>,
         initrd_end: Option<u64>,
-        with_console: bool,
+        virtio_devices: &[(u64, u32)],  // (base_addr, irq)
     ) -> Vec<u8> {
         // Start with structure block
         self.begin_node("");
@@ -196,14 +231,13 @@ impl DeviceTreeBuilder {
         self.add_prop_u32("interrupt-parent", 1);
         self.end_node();
 
-        // VirtIO console (if enabled)
-        if with_console {
-            let virtio_addr = Self::VIRTIO_MMIO_BASE;
+        // VirtIO devices
+        for &(virtio_addr, irq) in virtio_devices {
             self.begin_node(&format!("virtio_mmio@{:x}", virtio_addr));
             self.add_prop_string("compatible", "virtio,mmio");
             self.add_prop_reg64(virtio_addr, Self::VIRTIO_MMIO_SIZE);
-            // Interrupt: SPI 16, level high
-            self.add_prop_interrupts(0, Self::VIRTIO_CONSOLE_IRQ, 4); // GIC_SPI, IRQ 16, level high
+            // Interrupt: SPI irq, level high
+            self.add_prop_interrupts(0, irq, 4); // GIC_SPI, level high
             self.add_prop_u32("interrupt-parent", 1); // phandle of GIC
             self.add_prop_empty("dma-coherent");
             self.end_node();
@@ -438,5 +472,31 @@ mod tests {
         // Should have reasonable size (larger with virtio node)
         assert!(dtb.len() > 100);
         assert!(dtb.len() < 8192);
+    }
+
+    #[test]
+    fn test_build_dtb_with_all_devices() {
+        let dtb = DeviceTreeBuilder::build_with_devices(
+            256 * 1024 * 1024, // 256MB
+            "console=hvc0",
+            None,
+            None,
+            true,  // console
+            true,  // block
+            true,  // vsock
+            true,  // net
+        );
+
+        // Check FDT magic
+        let magic = u32::from_be_bytes([dtb[0], dtb[1], dtb[2], dtb[3]]);
+        assert_eq!(magic, 0xd00dfeed);
+
+        // Should have reasonable size (larger with 4 virtio nodes)
+        assert!(dtb.len() > 100);
+        assert!(dtb.len() < 8192);
+
+        // Verify virtio mmio addresses are in the DTB
+        let dtb_str = String::from_utf8_lossy(&dtb);
+        assert!(dtb_str.contains("virtio")); // Should have virtio,mmio string
     }
 }
