@@ -591,8 +591,11 @@ fn run_vm_loop(
 
     // Create VirtIO vsock device (always enabled for host-guest communication)
     const GUEST_CID: u64 = 3;  // Guest CID (first available after host=2)
-    let mut virtio_vsock = Some(VirtioMmioTransport::new(VirtioVsock::new(GUEST_CID), VIRTIO_VSOCK_BASE));
-    println!("Vsock: CID {} at 0x{:x}", GUEST_CID, VIRTIO_VSOCK_BASE);
+    const VSOCK_ECHO_PORT: u32 = 1234;  // Echo server port for testing
+    let mut vsock_device = VirtioVsock::new(GUEST_CID);
+    vsock_device.listen(VSOCK_ECHO_PORT);  // Enable echo server on port 1234
+    let mut virtio_vsock = Some(VirtioMmioTransport::new(vsock_device, VIRTIO_VSOCK_BASE));
+    println!("Vsock: CID {} at 0x{:x} (echo server on port {})", GUEST_CID, VIRTIO_VSOCK_BASE, VSOCK_ECHO_PORT);
 
     // Create VirtIO network device if enabled
     // Note: vmnet backend is disabled due to entitlement issues with ad-hoc signing.
@@ -653,8 +656,9 @@ fn run_vm_loop(
             }
         }
 
-        // Inject IRQ to wake guest if we have pending VirtIO interrupt
-        if need_irq {
+        // Inject IRQ to wake guest if we have any pending interrupt
+        // This covers both pre-loop processing (need_irq) and interrupts set during MMIO handling
+        if need_irq || timer_irq_pending || virtio_irq_pending || blk_irq_pending || vsock_irq_pending || net_irq_pending {
             if let Some(vcpu) = vm.vcpu_mut(0) {
                 use microvm::backend::hvf::bindings::arm64_interrupt::HV_INTERRUPT_TYPE_IRQ;
                 let _ = vcpu.set_pending_interrupt(HV_INTERRUPT_TYPE_IRQ, true);
@@ -702,6 +706,7 @@ fn run_vm_loop(
                                     let memory = vm.memory_mut().as_mut_slice();
                                     if transport.device_mut().process_rx(memory) {
                                         transport.signal_interrupt();
+                                        virtio_irq_pending = true;
                                     }
                                 }
                             }
@@ -718,6 +723,7 @@ fn run_vm_loop(
                                     let _ = std::io::stdout().write_all(&output);
                                     let _ = std::io::stdout().flush();
                                     transport.signal_interrupt();
+                                    virtio_irq_pending = true;
                                 }
                             }
                         }
@@ -796,10 +802,20 @@ fn run_vm_loop(
                                 let memory = vm.memory_mut().as_mut_slice();
                                 let packets = transport.device_mut().process_tx(memory);
                                 if !packets.is_empty() {
-                                    // Packets received from guest - could process here
-                                    // For now, just signal interrupt
                                     transport.signal_interrupt();
                                     vsock_irq_pending = true;
+
+                                    // Process echo server - echo received data back to guest
+                                    transport.device_mut().process_echo();
+                                }
+
+                                // Deliver any pending RX packets (RESPONSE, echo data, etc.)
+                                if transport.device().has_rx_data() {
+                                    let memory = vm.memory_mut().as_mut_slice();
+                                    if transport.device_mut().process_rx(memory) {
+                                        transport.signal_interrupt();
+                                        vsock_irq_pending = true;
+                                    }
                                 }
                             }
                         }

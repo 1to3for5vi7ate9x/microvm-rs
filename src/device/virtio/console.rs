@@ -114,6 +114,11 @@ impl VirtioConsole {
     pub fn process_tx(&mut self, memory: &mut [u8]) -> Vec<u8> {
         let mut output = Vec::new();
 
+        // Don't process if queue isn't ready
+        if !self.tx_queue.ready {
+            return output;
+        }
+
         while self.tx_queue.has_available(memory) {
             if let Some((head_idx, first_desc)) = self.tx_queue.pop_available(memory) {
                 // Read data from descriptor chain
@@ -153,6 +158,11 @@ impl VirtioConsole {
     pub fn process_rx(&mut self, memory: &mut [u8]) -> bool {
         let mut delivered = false;
 
+        // Don't process if queue isn't ready
+        if !self.rx_queue.ready {
+            return false;
+        }
+
         while !self.input_buffer.is_empty() && self.rx_queue.has_available(memory) {
             if let Some((head_idx, first_desc)) = self.rx_queue.pop_available(memory) {
                 let mut total_written = 0u32;
@@ -185,9 +195,10 @@ impl VirtioConsole {
                     }
                 }
 
+                // IMPORTANT: Always add to used ring after popping from avail ring,
+                // even if we wrote 0 bytes. Otherwise we lose the descriptor.
+                self.rx_queue.add_used(memory, head_idx, total_written);
                 if total_written > 0 {
-                    // Add to used ring
-                    self.rx_queue.add_used(memory, head_idx, total_written);
                     self.interrupt_status |= 1;
                     delivered = true;
                 }

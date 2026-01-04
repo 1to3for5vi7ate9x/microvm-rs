@@ -1,0 +1,50 @@
+#!/usr/bin/expect -f
+set timeout 30
+
+spawn ./target/release/microvm run --kernel test-assets/Image --initrd test-assets/initramfs.cpio.gz --console
+
+# Wait for shell prompt
+expect {
+    "~ #" {
+        send_user "\n=== Got shell prompt, running vsock_test ===\n"
+    }
+    timeout {
+        send_user "\n=== Timeout waiting for shell ===\n"
+        exit 1
+    }
+}
+
+# Wait a bit for kernel messages to settle
+sleep 2
+
+# Run vsock test
+send "vsock_test\r"
+
+# Wait for result
+expect {
+    "SUCCESS" {
+        send_user "\n\n=== VSOCK TEST PASSED ===\n\n"
+    }
+    "MISMATCH" {
+        send_user "\n\n=== VSOCK TEST FAILED (mismatch) ===\n\n"
+    }
+    "connect" {
+        # Might be an error message
+        expect {
+            "SUCCESS" {
+                send_user "\n\n=== VSOCK TEST PASSED ===\n\n"
+            }
+            timeout {
+                send_user "\n\n=== VSOCK TEST TIMEOUT ===\n\n"
+            }
+        }
+    }
+    timeout {
+        send_user "\n\n=== VSOCK TEST TIMEOUT ===\n\n"
+    }
+}
+
+# Exit gracefully
+send "\x03"
+sleep 1
+exit 0

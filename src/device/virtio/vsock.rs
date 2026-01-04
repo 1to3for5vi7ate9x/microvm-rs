@@ -296,39 +296,55 @@ impl VirtioVsock {
             return;
         }
 
-        // Parse header (simplified - just read the op)
-        let op = u16::from_le_bytes([data[40], data[41]]);
-        let src_port = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+        // Parse header fields
+        // VsockHeader layout:
+        //   src_cid: u64  (0-7)
+        //   dst_cid: u64  (8-15)
+        //   src_port: u32 (16-19)
+        //   dst_port: u32 (20-23)
+        //   len: u32      (24-27)
+        //   type_: u16    (28-29)
+        //   op: u16       (30-31)
+        //   flags: u32    (32-35)
+        //   buf_alloc: u32(36-39)
+        //   fwd_cnt: u32  (40-43)
+        let src_cid = u64::from_le_bytes([data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]]);
         let dst_cid = u64::from_le_bytes([data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15]]);
+        let src_port = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
         let dst_port = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
+        let _len = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
+        let _type = u16::from_le_bytes([data[28], data[29]]);
+        let op = u16::from_le_bytes([data[30], data[31]]);
 
+        // For incoming packets from guest:
+        // - src_cid = guest's CID
+        // - dst_cid = host's CID (should be 2)
+        // - src_port = guest's port
+        // - dst_port = host's port (what guest is connecting to)
+
+        // Key for looking up connections (from HOST perspective)
         let key = ConnKey {
-            local_port: src_port,
-            peer_cid: dst_cid,
-            peer_port: dst_port,
+            local_port: dst_port,     // Our port
+            peer_cid: src_cid,        // Guest's CID
+            peer_port: src_port,      // Guest's port
         };
 
         match op {
             op::REQUEST => {
-                // Incoming connection request - accept if we have a listener
+                // Incoming connection request from guest - accept if we have a listener
                 if self.listeners.contains_key(&dst_port) {
-                    let mut conn = VsockConnection::new(dst_port, cid::HOST, src_port);
+                    let mut conn = VsockConnection::new(dst_port, src_cid, src_port);
                     conn.state = ConnState::Connected;
+                    self.connections.insert(key.clone(), conn);
 
-                    let accept_key = ConnKey {
-                        local_port: dst_port,
-                        peer_cid: cid::HOST,
-                        peer_port: src_port,
-                    };
-                    self.connections.insert(accept_key, conn);
-
-                    // Queue response
+                    // Queue RESPONSE packet to guest
+                    // From host perspective: we send FROM host TO guest
                     let mut pkt = vec![0u8; VsockHeader::SIZE];
-                    self.write_header(
+                    self.write_response_header(
                         &mut pkt,
-                        cid::HOST,
-                        src_port,
-                        dst_port,
+                        src_cid,      // dst_cid = guest
+                        src_port,     // dst_port = guest's port
+                        dst_port,     // src_port = our port (1234)
                         0,
                         pkt_type::STREAM,
                         op::RESPONSE,
@@ -411,6 +427,11 @@ impl VirtioVsock {
     pub fn process_rx(&mut self, memory: &mut [u8]) -> bool {
         let mut delivered = false;
 
+        // Don't process if queue isn't ready
+        if !self.rx_queue.ready {
+            return false;
+        }
+
         while let Some(pkt) = self.rx_pending.front() {
             // Get an available buffer from the guest
             if let Some((head_idx, desc)) = self.rx_queue.pop_available(memory) {
@@ -447,6 +468,11 @@ impl VirtioVsock {
     pub fn process_tx(&mut self, memory: &mut [u8]) -> Vec<Vec<u8>> {
         let mut received = Vec::new();
 
+        // Don't process if queue isn't ready
+        if !self.tx_queue.ready {
+            return received;
+        }
+
         while let Some((head_idx, first_desc)) = self.tx_queue.pop_available(memory) {
             if first_desc.is_write_only() {
                 // TX descriptors should be readable
@@ -454,21 +480,36 @@ impl VirtioVsock {
                 continue;
             }
 
-            // Read packet from guest buffer
-            let offset = super::queue::gpa_to_offset(first_desc.addr);
-            if let Some(offset) = offset {
-                let len = first_desc.len as usize;
-                if offset + len <= memory.len() {
-                    let mut pkt = vec![0u8; len];
-                    pkt.copy_from_slice(&memory[offset..offset + len]);
-
-                    // Process the packet (connection handling, etc.)
-                    self.process_tx_packet(&pkt);
-                    received.push(pkt);
-
-                    self.tx_queue.add_used(memory, head_idx, 0);
+            // Read packet from guest buffer, following descriptor chain
+            let mut pkt = Vec::new();
+            let mut current_desc = first_desc;
+            loop {
+                let offset = super::queue::gpa_to_offset(current_desc.addr);
+                if let Some(offset) = offset {
+                    let len = current_desc.len as usize;
+                    if offset + len <= memory.len() {
+                        pkt.extend_from_slice(&memory[offset..offset + len]);
+                    }
                 }
+
+                // Follow chain if NEXT flag is set
+                if current_desc.has_next() {
+                    if let Some(next_desc) = self.tx_queue.read_descriptor(memory, current_desc.next) {
+                        current_desc = next_desc;
+                        continue;
+                    }
+                }
+                break;
             }
+
+            if !pkt.is_empty() {
+                // Process the packet (connection handling, etc.)
+                self.process_tx_packet(&pkt);
+                received.push(pkt);
+            }
+
+            // IMPORTANT: Always add to used ring after popping from avail ring
+            self.tx_queue.add_used(memory, head_idx, 0);
         }
 
         if !received.is_empty() {
@@ -477,7 +518,7 @@ impl VirtioVsock {
         received
     }
 
-    /// Helper to write a vsock header.
+    /// Helper to write a vsock header (from guest perspective - used when guest initiates).
     fn write_header(
         &self,
         buf: &mut [u8],
@@ -498,6 +539,82 @@ impl VirtioVsock {
         buf[28..30].copy_from_slice(&type_.to_le_bytes());
         buf[30..32].copy_from_slice(&op.to_le_bytes());
         // flags, buf_alloc, fwd_cnt initialized to 0
+    }
+
+    /// Helper to write a vsock header for HOST responses (src_cid = HOST).
+    fn write_response_header(
+        &self,
+        buf: &mut [u8],
+        dst_cid: u64,
+        dst_port: u32,
+        src_port: u32,
+        len: u32,
+        type_: u16,
+        op: u16,
+    ) {
+        let src_cid = cid::HOST;  // Host is sending
+
+        buf[0..8].copy_from_slice(&src_cid.to_le_bytes());
+        buf[8..16].copy_from_slice(&dst_cid.to_le_bytes());
+        buf[16..20].copy_from_slice(&src_port.to_le_bytes());
+        buf[20..24].copy_from_slice(&dst_port.to_le_bytes());
+        buf[24..28].copy_from_slice(&len.to_le_bytes());
+        buf[28..30].copy_from_slice(&type_.to_le_bytes());
+        buf[30..32].copy_from_slice(&op.to_le_bytes());
+        // flags at 32-35 = 0
+        // buf_alloc at 36-39 = 64KB buffer space for receiving
+        let buf_alloc: u32 = 64 * 1024;
+        buf[36..40].copy_from_slice(&buf_alloc.to_le_bytes());
+        // fwd_cnt at 40-43 = 0 initially
+    }
+
+    /// Queue a data packet to send to the guest (from host).
+    pub fn queue_data_packet(&mut self, dst_cid: u64, dst_port: u32, src_port: u32, data: &[u8]) {
+        let mut pkt = vec![0u8; VsockHeader::SIZE + data.len()];
+        // Use response header since host is sending to guest
+        self.write_response_header(
+            &mut pkt,
+            dst_cid,
+            dst_port,
+            src_port,
+            data.len() as u32,
+            pkt_type::STREAM,
+            op::RW,
+        );
+        pkt[VsockHeader::SIZE..].copy_from_slice(data);
+        self.rx_pending.push_back(pkt);
+    }
+
+    /// Process echo - for any connection with pending rx data, echo it back.
+    /// Returns true if any data was echoed.
+    pub fn process_echo(&mut self) -> bool {
+        let mut echoed = false;
+
+        // Collect connection info for connections with data
+        let connections_with_data: Vec<(ConnKey, Vec<u8>)> = self.connections
+            .iter_mut()
+            .filter(|(_, conn)| conn.state == ConnState::Connected && !conn.rx_buf.is_empty())
+            .map(|(key, conn)| {
+                let data: Vec<u8> = conn.rx_buf.drain(..).collect();
+                (*key, data)
+            })
+            .collect();
+
+        // Echo the data back
+        for (key, data) in connections_with_data {
+            if !data.is_empty() {
+                // Echo back: src becomes dst
+                self.queue_data_packet(key.peer_cid, key.peer_port, key.local_port, &data);
+                echoed = true;
+            }
+        }
+
+        echoed
+    }
+
+    /// Get list of active connections (for debugging).
+    pub fn connections(&self) -> impl Iterator<Item = (&ConnKey, &VsockConnection)> {
+        self.connections.iter()
     }
 }
 

@@ -95,8 +95,8 @@ fn run_linux_boot(kernel_path: &str, initrd_path: Option<&str>) {
         };
     }
 
-    // Set command line - use rdinit to go straight to shell
-    let loader = loader.with_cmdline("console=ttyAMA0 earlycon=pl011,0x09000000 panic=1 rdinit=/bin/sh");
+    // Set command line - use init=/init to run our init script
+    let loader = loader.with_cmdline("console=ttyAMA0 earlycon=pl011,0x09000000 panic=1 init=/init");
 
     // Create VM with more memory for the kernel and initrd
     println!("\nCreating VM...");
@@ -395,7 +395,7 @@ fn handle_psci_call(function_id: u64) -> u64 {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
     use microvm::backend::hvf::{bindings::{arm64_reg, arm64_interrupt}, vcpu::VcpuExit};
-    use microvm::device::{Gic, Pl011};
+    use microvm::device::{Gic, Pl011, gic::VTIMER_IRQ};
     use std::io::Write;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
@@ -442,8 +442,8 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
         // Check for timeout
         if start_time.elapsed() > max_runtime {
             eprintln!("\n[Timeout after {:?}]", start_time.elapsed());
-            eprintln!("[Exit counts: MMIO_R={}, MMIO_W={}, Exception={}, Shutdown={}, VTimer={}]",
-                mmio_read_count, mmio_write_count, exception_count, shutdown_count, vtimer_count);
+            eprintln!("[Exit counts: MMIO_R={}, MMIO_W={}, Shutdown={}, VTimer={}]",
+                mmio_read_count, mmio_write_count, shutdown_count, vtimer_count);
             running.store(false, Ordering::Relaxed);
             break;
         }
@@ -458,7 +458,9 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
         let current_tick = timer_ticks.load(Ordering::Relaxed);
         if current_tick > last_tick {
             last_tick = current_tick;
-            // Inject timer IRQ
+            // Set timer IRQ pending in GIC
+            gic.set_pending(VTIMER_IRQ);
+            // Inject IRQ signal to vCPU
             let vcpu = vm.vcpu_mut(0).unwrap();
             let _ = vcpu.set_pending_interrupt(arm64_interrupt::HV_INTERRUPT_TYPE_IRQ, true);
         }
@@ -481,15 +483,8 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
                 let value = vcpu.read_register(arm64_reg::HV_REG_X0 + srt).unwrap_or(0) as u32;
 
                 if uart.contains(addr) {
+                    // uart.write() already outputs to stdout, no need to print again
                     uart.write(addr, value);
-                    // Print the character being written
-                    if addr == 0x09000000 && value >= 0x20 && value < 0x7F {
-                        print!("{}", value as u8 as char);
-                        let _ = std::io::stdout().flush();
-                    } else if addr == 0x09000000 && (value == 0x0A || value == 0x0D) {
-                        print!("{}", value as u8 as char);
-                        let _ = std::io::stdout().flush();
-                    }
                 } else if gic.contains(addr) {
                     gic.write(addr, value);
                 }
@@ -537,13 +532,26 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
             }
             Ok(VcpuExit::VTimer) => {
                 vtimer_count += 1;
-                // Virtual timer fired - inject IRQ and unmask for next timer
+                // Virtual timer fired - the ARM generic timer works via system registers,
+                // not GIC MMIO. The kernel reads CNTV_CTL_EL0 directly.
+                // Just mask the timer to prevent re-triggering and let kernel handle it.
                 let vcpu = vm.vcpu_mut(0).unwrap();
+                let _ = vcpu.set_vtimer_mask(true);  // Mask to prevent immediate re-exit
+                // Inject IRQ so kernel takes interrupt exception
                 let _ = vcpu.set_pending_interrupt(arm64_interrupt::HV_INTERRUPT_TYPE_IRQ, true);
-                let _ = vcpu.set_vtimer_mask(false);
             }
             Ok(VcpuExit::Wfi) => {
-                // WFI - Wait For Interrupt. Skip and continue.
+                // WFI - Wait For Interrupt.
+                // If an interrupt is pending, inject it and continue
+                // Otherwise, briefly sleep to wait for timer
+                if gic.get_pending_irq().is_some() {
+                    let vcpu = vm.vcpu_mut(0).unwrap();
+                    let _ = vcpu.set_pending_interrupt(arm64_interrupt::HV_INTERRUPT_TYPE_IRQ, true);
+                } else {
+                    // No interrupt pending - sleep briefly to wait for timer
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
+                // Advance past WFI
                 let vcpu = vm.vcpu_mut(0).unwrap();
                 let pc = vcpu.read_register(arm64_reg::HV_REG_PC).unwrap_or(0);
                 let _ = vcpu.write_register(arm64_reg::HV_REG_PC, pc + 4);
@@ -653,6 +661,18 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
                 println!("\n[Exit reason {} at PC=0x{:x}]", reason, pc);
                 break;
             }
+            Ok(VcpuExit::SystemRegAccess { reg, is_write, rt, .. }) => {
+                // Handle system register access by providing a default value
+                let vcpu = vm.vcpu_mut(0).unwrap();
+                let pc = vcpu.read_register(arm64_reg::HV_REG_PC).unwrap_or(0);
+                if !is_write {
+                    // For reads, return 0 to the destination register
+                    let dest_reg = arm64_reg::HV_REG_X0 + rt as u32;
+                    let _ = vcpu.write_register(dest_reg, 0);
+                }
+                // Advance past the instruction
+                let _ = vcpu.write_register(arm64_reg::HV_REG_PC, pc + 4);
+            }
             Ok(exit) => {
                 println!("\n[Unexpected exit: {:?}]", exit);
                 break;
@@ -671,6 +691,7 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
             eprint!(".");
             let _ = std::io::stderr().flush();
         }
+
     }
 
     println!("\nBoot test completed.");

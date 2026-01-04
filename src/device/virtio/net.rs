@@ -291,6 +291,11 @@ impl VirtioNet {
     pub fn process_tx(&mut self, memory: &[u8]) -> bool {
         let mut processed = false;
 
+        // Don't process if queue isn't ready
+        if !self.tx_queue.ready {
+            return false;
+        }
+
         while let Some((head_idx, first_desc)) = self.tx_queue.pop_available(memory) {
             // Collect the packet data from the descriptor chain
             let mut packet_data = Vec::new();
@@ -352,6 +357,11 @@ impl VirtioNet {
     pub fn process_tx_mut(&mut self, memory: &mut [u8]) -> bool {
         let mut processed = false;
 
+        // Don't process if queue isn't ready
+        if !self.tx_queue.ready {
+            return false;
+        }
+
         while let Some((head_idx, first_desc)) = self.tx_queue.pop_available(memory) {
             // Collect the packet data from the descriptor chain
             let mut packet_data = Vec::new();
@@ -410,6 +420,11 @@ impl VirtioNet {
     pub fn process_rx(&mut self, memory: &mut [u8]) -> bool {
         let mut processed = false;
 
+        // Don't process if queue isn't ready
+        if !self.rx_queue.ready {
+            return false;
+        }
+
         // Get available packet
         let packet = match self.pop_rx() {
             Some(p) => p,
@@ -418,6 +433,8 @@ impl VirtioNet {
 
         // Try to get an available buffer from RX queue
         if let Some((head_idx, first_desc)) = self.rx_queue.pop_available(memory) {
+            let mut total_written = 0u32;
+
             if first_desc.is_write_only() {
                 let offset = first_desc.addr as usize;
                 let available_len = first_desc.len as usize;
@@ -439,12 +456,14 @@ impl VirtioNet {
                         memory[offset + VirtioNetHeader::SIZE..offset + VirtioNetHeader::SIZE + data_len]
                             .copy_from_slice(&packet[..data_len]);
 
-                        let total_written = VirtioNetHeader::SIZE + data_len;
-                        self.rx_queue.add_used(memory, head_idx, total_written as u32);
+                        total_written = (VirtioNetHeader::SIZE + data_len) as u32;
                         processed = true;
                     }
                 }
             }
+
+            // IMPORTANT: Always add to used ring after popping from avail ring
+            self.rx_queue.add_used(memory, head_idx, total_written);
         } else {
             // No available buffer, re-queue the packet
             self.rx_pending.push_front(packet);

@@ -1,8 +1,7 @@
-//! Simple GIC (Generic Interrupt Controller) stub for ARM64.
+//! Simple GIC (Generic Interrupt Controller) for ARM64.
 //!
-//! This provides a minimal GICv2 implementation that allows Linux to boot.
-//! It doesn't actually handle interrupts, but returns sensible values
-//! for Linux's probing and initialization.
+//! This provides a minimal GICv2 implementation that handles timer
+//! interrupts, allowing Linux to boot and run.
 
 /// GICv2 Distributor base address
 pub const GICD_BASE: u64 = 0x0800_0000;
@@ -13,6 +12,9 @@ pub const GICD_SIZE: u64 = 0x1_0000;
 pub const GICC_BASE: u64 = 0x0801_0000;
 /// GICv2 CPU Interface size
 pub const GICC_SIZE: u64 = 0x1_0000;
+
+/// Virtual Timer IRQ (PPI 11 = IRQ 27)
+pub const VTIMER_IRQ: u32 = 27;
 
 /// GIC Distributor registers
 mod gicd {
@@ -45,8 +47,7 @@ mod gicc {
     pub const IIDR: u64 = 0x00FC;  // CPU Interface Identification
 }
 
-/// Simple GIC stub that allows Linux to boot.
-#[derive(Default)]
+/// GIC that tracks pending interrupts.
 pub struct Gic {
     /// Distributor control register
     gicd_ctlr: u32,
@@ -54,16 +55,88 @@ pub struct Gic {
     gicc_ctlr: u32,
     /// Priority mask
     gicc_pmr: u32,
+    /// Pending interrupt bitmap (256 interrupts)
+    pending: [u32; 8],
+    /// Enabled interrupt bitmap (256 interrupts)
+    enabled: [u32; 8],
+    /// Currently active interrupt (being serviced)
+    active_irq: Option<u32>,
+}
+
+impl Default for Gic {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Gic {
     /// Create a new GIC instance.
     pub fn new() -> Self {
+        let mut enabled = [0u32; 8];
+        // Enable PPIs (16-31) by default - they include timer interrupts
+        enabled[0] = 0xFFFF_0000;
+
         Self {
             gicd_ctlr: 0,
             gicc_ctlr: 0,
             gicc_pmr: 0xFF, // All priorities enabled
+            pending: [0u32; 8],
+            enabled,
+            active_irq: None,
         }
+    }
+
+    /// Set an interrupt as pending.
+    pub fn set_pending(&mut self, irq: u32) {
+        if irq < 256 {
+            let idx = (irq / 32) as usize;
+            let bit = irq % 32;
+            self.pending[idx] |= 1 << bit;
+        }
+    }
+
+    /// Clear a pending interrupt.
+    pub fn clear_pending(&mut self, irq: u32) {
+        if irq < 256 {
+            let idx = (irq / 32) as usize;
+            let bit = irq % 32;
+            self.pending[idx] &= !(1 << bit);
+        }
+    }
+
+    /// Check if an interrupt is pending.
+    pub fn is_pending(&self, irq: u32) -> bool {
+        if irq < 256 {
+            let idx = (irq / 32) as usize;
+            let bit = irq % 32;
+            (self.pending[idx] & (1 << bit)) != 0
+        } else {
+            false
+        }
+    }
+
+    /// Check if an interrupt is enabled.
+    pub fn is_enabled(&self, irq: u32) -> bool {
+        if irq < 256 {
+            let idx = (irq / 32) as usize;
+            let bit = irq % 32;
+            (self.enabled[idx] & (1 << bit)) != 0
+        } else {
+            false
+        }
+    }
+
+    /// Get the highest priority pending interrupt.
+    pub fn get_pending_irq(&self) -> Option<u32> {
+        for idx in 0..8 {
+            let pending_enabled = self.pending[idx] & self.enabled[idx];
+            if pending_enabled != 0 {
+                // Find lowest set bit (highest priority)
+                let bit = pending_enabled.trailing_zeros();
+                return Some((idx as u32) * 32 + bit);
+            }
+        }
+        None
     }
 
     /// Check if address is in GIC range.
@@ -73,7 +146,7 @@ impl Gic {
     }
 
     /// Read from GIC register.
-    pub fn read(&self, addr: u64) -> u32 {
+    pub fn read(&mut self, addr: u64) -> u32 {
         if addr >= GICD_BASE && addr < GICD_BASE + GICD_SIZE {
             self.read_distributor(addr - GICD_BASE)
         } else if addr >= GICC_BASE && addr < GICC_BASE + GICC_SIZE {
@@ -107,6 +180,14 @@ impl Gic {
                 // GICv2
                 0x20
             }
+            o if o >= gicd::ISENABLER && o < gicd::ISENABLER + 32 => {
+                let idx = ((o - gicd::ISENABLER) / 4) as usize;
+                if idx < 8 { self.enabled[idx] } else { 0 }
+            }
+            o if o >= gicd::ISPENDR && o < gicd::ISPENDR + 32 => {
+                let idx = ((o - gicd::ISPENDR) / 4) as usize;
+                if idx < 8 { self.pending[idx] } else { 0 }
+            }
             _ => 0,
         }
     }
@@ -114,17 +195,49 @@ impl Gic {
     fn write_distributor(&mut self, offset: u64, value: u32) {
         match offset {
             gicd::CTLR => self.gicd_ctlr = value,
+            o if o >= gicd::ISENABLER && o < gicd::ISENABLER + 32 => {
+                // Set-enable: writing 1 enables the interrupt
+                let idx = ((o - gicd::ISENABLER) / 4) as usize;
+                if idx < 8 { self.enabled[idx] |= value; }
+            }
+            o if o >= gicd::ICENABLER && o < gicd::ICENABLER + 32 => {
+                // Clear-enable: writing 1 disables the interrupt
+                let idx = ((o - gicd::ICENABLER) / 4) as usize;
+                if idx < 8 { self.enabled[idx] &= !value; }
+            }
+            o if o >= gicd::ISPENDR && o < gicd::ISPENDR + 32 => {
+                // Set-pending: writing 1 sets interrupt pending
+                let idx = ((o - gicd::ISPENDR) / 4) as usize;
+                if idx < 8 { self.pending[idx] |= value; }
+            }
+            o if o >= gicd::ICPENDR && o < gicd::ICPENDR + 32 => {
+                // Clear-pending: writing 1 clears pending state
+                let idx = ((o - gicd::ICPENDR) / 4) as usize;
+                if idx < 8 { self.pending[idx] &= !value; }
+            }
             _ => {}
         }
     }
 
-    fn read_cpu_interface(&self, offset: u64) -> u32 {
+    fn read_cpu_interface(&mut self, offset: u64) -> u32 {
         match offset {
             gicc::CTLR => self.gicc_ctlr,
             gicc::PMR => self.gicc_pmr,
             gicc::IAR => {
-                // No pending interrupt (spurious)
-                1023
+                // Return the highest priority pending interrupt
+                if let Some(irq) = self.get_pending_irq() {
+                    // Clear pending and mark as active
+                    self.clear_pending(irq);
+                    self.active_irq = Some(irq);
+                    irq
+                } else {
+                    // No pending interrupt (spurious)
+                    1023
+                }
+            }
+            gicc::HPPIR => {
+                // Return highest priority pending without acknowledging
+                self.get_pending_irq().unwrap_or(1023)
             }
             gicc::IIDR => {
                 // ARM GIC
@@ -139,7 +252,10 @@ impl Gic {
             gicc::CTLR => self.gicc_ctlr = value,
             gicc::PMR => self.gicc_pmr = value,
             gicc::EOIR => {
-                // Acknowledge end of interrupt - nothing to do for stub
+                // End of interrupt - clear active state
+                if self.active_irq == Some(value) {
+                    self.active_irq = None;
+                }
             }
             _ => {}
         }
