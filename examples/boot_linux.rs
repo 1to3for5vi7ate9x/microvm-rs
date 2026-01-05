@@ -98,10 +98,10 @@ fn run_linux_boot(kernel_path: &str, initrd_path: Option<&str>) {
     // Set command line - use init=/init to run our init script
     let loader = loader.with_cmdline("console=ttyAMA0 earlycon=pl011,0x09000000 panic=1 init=/init");
 
-    // Create VM with more memory for the kernel and initrd
+    // Create VM with enough memory for the kernel and initrd
     println!("\nCreating VM...");
     let config = VmConfig {
-        memory_mb: 1024, // 1GB to accommodate kernel + initrd + userspace
+        memory_mb: 512, // 512MB to accommodate kernel + initrd + userspace
         vcpus: 1,
         kernel: Some(kernel_path.into()),
         initrd: initrd_path.map(|s| s.into()),
@@ -159,11 +159,15 @@ fn run_linux_boot(kernel_path: &str, initrd_path: Option<&str>) {
         None
     };
 
-    let dtb = microvm::loader::arm64::DeviceTreeBuilder::build_minimal(
-        1024 * 1024 * 1024, // 1GB
+    let dtb = microvm::loader::arm64::DeviceTreeBuilder::build_with_devices(
+        512 * 1024 * 1024, // 512MB
         loader.cmdline(),
         initrd_info.map(|(s, _)| s),
         initrd_info.map(|(_, e)| e),
+        false, // console (using PL011 instead)
+        false, // block
+        true,  // vsock - for host-guest communication
+        false, // net
     );
 
     // Write DTB to memory (at RAM_BASE + 64KB, before kernel at RAM_BASE + 2MB)
@@ -396,6 +400,8 @@ fn handle_psci_call(function_id: u64) -> u64 {
 fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
     use microvm::backend::hvf::{bindings::{arm64_reg, arm64_interrupt}, vcpu::VcpuExit};
     use microvm::device::{Gic, Pl011, gic::VTIMER_IRQ};
+    use microvm::device::virtio::{VirtioMmioTransport, VirtioVsock};
+    use microvm::loader::arm64::DeviceTreeBuilder;
     use std::io::Write;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
@@ -403,6 +409,25 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
     // Create devices
     let mut uart = Pl011::default();
     let mut gic = Gic::new();
+
+    // Create vsock device - guest CID is 3 (host is 2)
+    const GUEST_CID: u64 = 3;
+    const VSOCK_PORT: u32 = 7600; // Port where velocitty-daemon listens
+    const HOST_PORT: u32 = 1234;  // Our local port for the connection
+    let vsock = VirtioVsock::new(GUEST_CID);
+    let vsock_base = DeviceTreeBuilder::VIRTIO_MMIO_BASE + 2 * DeviceTreeBuilder::VIRTIO_MMIO_SIZE;
+    let mut vsock_transport = VirtioMmioTransport::new(vsock, vsock_base);
+
+    // Host listens on port 1234 for responses from guest
+    vsock_transport.device_mut().listen(HOST_PORT);
+
+    // Vsock connection state
+    let mut vsock_connected = false;
+    let mut vsock_connection_sent = false;
+    let mut vsock_test_sent = false;
+    let mut boot_complete = false;
+    let boot_start = std::time::Instant::now();
+
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = Arc::clone(&running);
     let timer_ticks = Arc::new(AtomicU64::new(0));
@@ -465,6 +490,115 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
             let _ = vcpu.set_pending_interrupt(arm64_interrupt::HV_INTERRUPT_TYPE_IRQ, true);
         }
 
+        // Vsock connection logic - attempt after boot complete
+        if boot_complete && !vsock_connection_sent {
+            // Wait a bit more after boot complete for daemon to be ready
+            if boot_start.elapsed() > std::time::Duration::from_secs(2) {
+                println!("\n[HOST] Initiating vsock connection to guest port {}...", VSOCK_PORT);
+
+                // Build and send CONNECTION REQUEST packet
+                // vsock header: src_cid(8) + dst_cid(8) + src_port(4) + dst_port(4) + len(4) + type(2) + op(2) + flags(4) + buf_alloc(4) + fwd_cnt(4) = 44 bytes
+                let mut pkt = vec![0u8; 44];
+                // src_cid = HOST (2)
+                pkt[0..8].copy_from_slice(&2u64.to_le_bytes());
+                // dst_cid = GUEST (3)
+                pkt[8..16].copy_from_slice(&GUEST_CID.to_le_bytes());
+                // src_port = HOST_PORT
+                pkt[16..20].copy_from_slice(&HOST_PORT.to_le_bytes());
+                // dst_port = VSOCK_PORT (7600)
+                pkt[20..24].copy_from_slice(&VSOCK_PORT.to_le_bytes());
+                // len = 0 (no payload)
+                pkt[24..28].copy_from_slice(&0u32.to_le_bytes());
+                // type = STREAM (1)
+                pkt[28..30].copy_from_slice(&1u16.to_le_bytes());
+                // op = REQUEST (1)
+                pkt[30..32].copy_from_slice(&1u16.to_le_bytes());
+                // flags = 0
+                pkt[32..36].copy_from_slice(&0u32.to_le_bytes());
+                // buf_alloc = 64KB
+                pkt[36..40].copy_from_slice(&(64 * 1024u32).to_le_bytes());
+                // fwd_cnt = 0
+                pkt[40..44].copy_from_slice(&0u32.to_le_bytes());
+
+                // Queue packet to RX (host->guest)
+                vsock_transport.device_mut().queue_raw_packet(pkt);
+
+                // Sync all queues from transport to device (copy queue data first to avoid borrow issues)
+                let queues: Vec<_> = (0..3).filter_map(|i| vsock_transport.queue(i).cloned()).collect();
+                for (i, queue) in queues.iter().enumerate() {
+                    match i {
+                        0 => vsock_transport.device_mut().sync_rx_queue(queue),
+                        1 => vsock_transport.device_mut().sync_tx_queue(queue),
+                        2 => vsock_transport.device_mut().sync_event_queue(queue),
+                        _ => {}
+                    }
+                }
+
+                // Try to deliver the packet
+                {
+                    let memory = vm.memory_mut().as_mut_slice();
+                    if vsock_transport.device_mut().process_rx(memory) {
+                        vsock_transport.signal_interrupt();
+                        gic.set_pending(32 + DeviceTreeBuilder::VIRTIO_VSOCK_IRQ);
+                        println!("[HOST] CONNECTION REQUEST sent to guest");
+                    } else {
+                        println!("[HOST] Could not deliver REQUEST - RX queue not ready");
+                    }
+                }
+
+                vsock_connection_sent = true;
+            }
+        }
+
+        // Send test data after connection is established
+        if vsock_connected && !vsock_test_sent {
+            println!("\n[HOST] Sending test message to guest...");
+
+            // Build RW (data) packet
+            let test_data = b"Hello from microvm-rs host!";
+            let mut pkt = vec![0u8; 44 + test_data.len()];
+            // src_cid = HOST (2)
+            pkt[0..8].copy_from_slice(&2u64.to_le_bytes());
+            // dst_cid = GUEST (3)
+            pkt[8..16].copy_from_slice(&GUEST_CID.to_le_bytes());
+            // src_port = HOST_PORT
+            pkt[16..20].copy_from_slice(&HOST_PORT.to_le_bytes());
+            // dst_port = VSOCK_PORT (7600)
+            pkt[20..24].copy_from_slice(&VSOCK_PORT.to_le_bytes());
+            // len = payload length
+            pkt[24..28].copy_from_slice(&(test_data.len() as u32).to_le_bytes());
+            // type = STREAM (1)
+            pkt[28..30].copy_from_slice(&1u16.to_le_bytes());
+            // op = RW (5)
+            pkt[30..32].copy_from_slice(&5u16.to_le_bytes());
+            // flags = 0
+            pkt[32..36].copy_from_slice(&0u32.to_le_bytes());
+            // buf_alloc = 64KB
+            pkt[36..40].copy_from_slice(&(64 * 1024u32).to_le_bytes());
+            // fwd_cnt = 0
+            pkt[40..44].copy_from_slice(&0u32.to_le_bytes());
+            // payload
+            pkt[44..].copy_from_slice(test_data);
+
+            vsock_transport.device_mut().queue_raw_packet(pkt);
+
+            // Sync RX queue and deliver
+            if let Some(queue) = vsock_transport.queue(0).cloned() {
+                vsock_transport.device_mut().sync_rx_queue(&queue);
+            }
+
+            {
+                let memory = vm.memory_mut().as_mut_slice();
+                if vsock_transport.device_mut().process_rx(memory) {
+                    vsock_transport.signal_interrupt();
+                    gic.set_pending(32 + DeviceTreeBuilder::VIRTIO_VSOCK_IRQ);
+                    println!("[HOST] Test message sent to guest!");
+                }
+            }
+
+            vsock_test_sent = true;
+        }
+
         match exit {
             Ok(VcpuExit::MmioWrite { addr, syndrome, .. }) => {
                 mmio_write_count += 1;
@@ -478,18 +612,96 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
                     0 // Fallback to X0 if ISV not set
                 };
 
-                let vcpu = vm.vcpu_mut(0).unwrap();
-                let pc = vcpu.read_register(arm64_reg::HV_REG_PC).unwrap_or(0);
-                let value = vcpu.read_register(arm64_reg::HV_REG_X0 + srt).unwrap_or(0) as u32;
+                // Read registers first, then drop vcpu borrow
+                let (pc, value) = {
+                    let vcpu = vm.vcpu_mut(0).unwrap();
+                    let pc = vcpu.read_register(arm64_reg::HV_REG_PC).unwrap_or(0);
+                    let value = vcpu.read_register(arm64_reg::HV_REG_X0 + srt).unwrap_or(0) as u32;
+                    (pc, value)
+                };
 
                 if uart.contains(addr) {
                     // uart.write() already outputs to stdout, no need to print again
                     uart.write(addr, value);
+
+                    // Check for boot complete signal (daemon listening)
+                    // This is a simple heuristic - look for 'L' followed by 'i' (Listening)
+                    if !boot_complete && value as u8 == b'L' {
+                        // Check boot time - if > 0.5s, likely the daemon message
+                        if boot_start.elapsed() > std::time::Duration::from_millis(500) {
+                            boot_complete = true;
+                            println!("\n[HOST] Boot complete detected, will attempt vsock connection...");
+                        }
+                    }
                 } else if gic.contains(addr) {
                     gic.write(addr, value);
+                } else if vsock_transport.contains(addr) {
+                    vsock_transport.write(addr, value);
+
+                    // Check if this is a queue notify (offset 0x50)
+                    let offset = addr - vsock_transport.base_addr();
+                    if offset == 0x50 {
+                        // Queue notification - sync queues and process
+                        let queue_sel = vsock_transport.queue_sel() as usize;
+                        if let Some(queue) = vsock_transport.queue(queue_sel).cloned() {
+                            match queue_sel {
+                                0 => vsock_transport.device_mut().sync_rx_queue(&queue),
+                                1 => vsock_transport.device_mut().sync_tx_queue(&queue),
+                                2 => vsock_transport.device_mut().sync_event_queue(&queue),
+                                _ => {}
+                            }
+                        }
+
+                        // Process TX queue (guest -> host)
+                        let packets = {
+                            let memory = vm.memory_mut().as_mut_slice();
+                            vsock_transport.device_mut().process_tx(memory)
+                        };
+                        for pkt in &packets {
+                            if pkt.len() >= 44 {
+                                let op = u16::from_le_bytes([pkt[30], pkt[31]]);
+                                let src_port = u32::from_le_bytes([pkt[16], pkt[17], pkt[18], pkt[19]]);
+                                let payload_len = pkt.len() - 44;
+                                match op {
+                                    1 => println!("\n[VSOCK] Guest REQUEST from port {}", src_port),
+                                    2 => {
+                                        // RESPONSE - connection accepted
+                                        println!("\n[VSOCK] Guest RESPONSE from port {} - connection established!", src_port);
+                                        vsock_connected = true;
+                                    }
+                                    3 => println!("\n[VSOCK] Guest RST from port {}", src_port),
+                                    5 => {
+                                        // RW - data from guest
+                                        if payload_len > 0 {
+                                            let data = String::from_utf8_lossy(&pkt[44..]);
+                                            println!("\n[VSOCK] Received {} bytes from guest port {}: {}", payload_len, src_port, data.trim());
+                                        }
+                                    }
+                                    6 => {
+                                        // CREDIT_UPDATE
+                                        println!("\n[VSOCK] Guest CREDIT_UPDATE from port {}", src_port);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+
+                        // Process RX queue (host -> guest)
+                        {
+                            let memory = vm.memory_mut().as_mut_slice();
+                            if vsock_transport.device_mut().process_rx(memory) {
+                                // Packets were delivered, signal interrupt
+                                vsock_transport.signal_interrupt();
+                                gic.set_pending(32 + DeviceTreeBuilder::VIRTIO_VSOCK_IRQ);
+                            }
+                        }
+                    }
                 }
                 // Advance PC
-                let _ = vcpu.write_register(arm64_reg::HV_REG_PC, pc + 4);
+                {
+                    let vcpu = vm.vcpu_mut(0).unwrap();
+                    let _ = vcpu.write_register(arm64_reg::HV_REG_PC, pc + 4);
+                }
             }
             Ok(VcpuExit::MmioRead { addr, syndrome, .. }) => {
                 mmio_read_count += 1;
@@ -507,6 +719,8 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
                     uart.read(addr)
                 } else if gic.contains(addr) {
                     gic.read(addr)
+                } else if vsock_transport.contains(addr) {
+                    vsock_transport.read(addr)
                 } else {
                     0
                 };

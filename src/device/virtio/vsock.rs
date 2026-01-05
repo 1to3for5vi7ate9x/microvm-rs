@@ -568,6 +568,12 @@ impl VirtioVsock {
         // fwd_cnt at 40-43 = 0 initially
     }
 
+    /// Queue a raw packet to send to the guest (from host).
+    /// Used for connection requests and other control packets.
+    pub fn queue_raw_packet(&mut self, pkt: Vec<u8>) {
+        self.rx_pending.push_back(pkt);
+    }
+
     /// Queue a data packet to send to the guest (from host).
     pub fn queue_data_packet(&mut self, dst_cid: u64, dst_port: u32, src_port: u32, data: &[u8]) {
         let mut pkt = vec![0u8; VsockHeader::SIZE + data.len()];
