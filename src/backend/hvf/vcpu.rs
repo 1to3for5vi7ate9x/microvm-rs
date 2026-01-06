@@ -156,7 +156,7 @@ impl Vcpu {
     /// Initialize ARM64 vCPU state.
     #[cfg(target_arch = "aarch64")]
     fn init_arm64(&self) -> Result<()> {
-        use super::bindings::arm64_reg;
+        use super::bindings::{arm64_reg, arm64_sys_reg};
 
         // Set PC to 0 (will be updated when loading code)
         self.write_register(arm64_reg::HV_REG_PC, 0)?;
@@ -164,6 +164,13 @@ impl Vcpu {
         // Set CPSR (EL1h mode, interrupts masked at startup)
         // Bits: D=1 A=1 I=1 F=1 M=0b00101 (EL1h)
         self.write_register(arm64_reg::HV_REG_CPSR, 0x3C5)?;
+
+        // Set SCTLR_EL1 to disable MMU, caches, alignment checks
+        // Bit 0 (M) = 0: MMU disabled
+        // Bit 2 (C) = 0: Data cache disabled
+        // Bit 12 (I) = 0: Instruction cache disabled
+        // All other bits = 0 for clean state
+        self.write_sys_register(arm64_sys_reg::HV_SYS_REG_SCTLR_EL1, 0)?;
 
         // Unmask the vtimer so we get VM exits when it fires
         self.set_vtimer_mask(false)?;

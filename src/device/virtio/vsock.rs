@@ -463,6 +463,11 @@ impl VirtioVsock {
         delivered
     }
 
+    /// Check if TX queue is ready.
+    pub fn tx_queue_ready(&self) -> bool {
+        self.tx_queue.ready
+    }
+
     /// Process TX queue - receive packets from guest.
     /// Returns any data that was received from the guest (for host to process).
     pub fn process_tx(&mut self, memory: &mut [u8]) -> Vec<Vec<u8>> {

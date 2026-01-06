@@ -32,6 +32,7 @@ pub mod backend;
 pub mod device;
 pub mod loader;
 pub mod memory;
+pub mod proxy;
 
 // Re-exports
 pub use builder::VmBuilder;

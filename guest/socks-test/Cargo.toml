@@ -1,0 +1,14 @@
+[package]
+name = "socks-test"
+version = "0.1.0"
+edition = "2021"
+description = "Simple SOCKS5 test client"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"

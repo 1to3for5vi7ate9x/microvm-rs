@@ -101,7 +101,7 @@ fn run_linux_boot(kernel_path: &str, initrd_path: Option<&str>) {
     // Create VM with enough memory for the kernel and initrd
     println!("\nCreating VM...");
     let config = VmConfig {
-        memory_mb: 512, // 512MB to accommodate kernel + initrd + userspace
+        memory_mb: 1024, // 1GB to accommodate kernel + large initrd + userspace
         vcpus: 1,
         kernel: Some(kernel_path.into()),
         initrd: initrd_path.map(|s| s.into()),
@@ -160,7 +160,7 @@ fn run_linux_boot(kernel_path: &str, initrd_path: Option<&str>) {
     };
 
     let dtb = microvm::loader::arm64::DeviceTreeBuilder::build_with_devices(
-        512 * 1024 * 1024, // 512MB
+        1024 * 1024 * 1024, // 1GB
         loader.cmdline(),
         initrd_info.map(|(s, _)| s),
         initrd_info.map(|(_, e)| e),
@@ -414,12 +414,22 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
     const GUEST_CID: u64 = 3;
     const VSOCK_PORT: u32 = 7600; // Port where velocitty-daemon listens
     const HOST_PORT: u32 = 1234;  // Our local port for the connection
+    const PROXY_PORT: u32 = 7601; // Port for outbound proxy
     let vsock = VirtioVsock::new(GUEST_CID);
     let vsock_base = DeviceTreeBuilder::VIRTIO_MMIO_BASE + 2 * DeviceTreeBuilder::VIRTIO_MMIO_SIZE;
     let mut vsock_transport = VirtioMmioTransport::new(vsock, vsock_base);
 
     // Host listens on port 1234 for responses from guest
     vsock_transport.device_mut().listen(HOST_PORT);
+    // Host listens on port 7601 for outbound proxy connections
+    vsock_transport.device_mut().listen(PROXY_PORT);
+
+    // Create outbound proxy for guest networking
+    let mut outbound_proxy = microvm::proxy::VsockOutboundProxy::new();
+
+    // Track mapping from proxy conn_key to guest vsock port (src_port)
+    // This is needed because when TCP data comes back, we need to know which vsock port to send it to
+    let mut conn_key_to_guest_port: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
 
     // Vsock connection state
     let mut vsock_connected = false;
@@ -479,6 +489,29 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
             vcpu.run()
         };
 
+        // Poll vsock RX queue on every vCPU exit to deliver pending responses
+        // Note: TX processing is handled by MMIO QUEUE_NOTIFY handler
+        {
+            // Check if we have pending RX packets to deliver
+            if vsock_transport.device_mut().has_rx_data() {
+                // Sync RX queue and deliver responses
+                if let Some(queue) = vsock_transport.queue(0).cloned() {
+                    vsock_transport.device_mut().sync_rx_queue(&queue);
+                }
+                {
+                    let memory = vm.memory_mut().as_mut_slice();
+                    if vsock_transport.device_mut().process_rx(memory) {
+                        vsock_transport.signal_interrupt();
+                        gic.set_pending(32 + DeviceTreeBuilder::VIRTIO_VSOCK_IRQ);
+                        // Inject IRQ to wake up vCPU
+                        let vcpu = vm.vcpu_mut(0).unwrap();
+                        let _ = vcpu.set_pending_interrupt(arm64_interrupt::HV_INTERRUPT_TYPE_IRQ, true);
+                        println!("\n[VSOCK] Interrupt injected to vCPU");
+                    }
+                }
+            }
+        }
+
         // Check if we need to inject timer interrupt
         let current_tick = timer_ticks.load(Ordering::Relaxed);
         if current_tick > last_tick {
@@ -488,6 +521,25 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
             // Inject IRQ signal to vCPU
             let vcpu = vm.vcpu_mut(0).unwrap();
             let _ = vcpu.set_pending_interrupt(arm64_interrupt::HV_INTERRUPT_TYPE_IRQ, true);
+
+            // Periodically check for pending vsock RX packets (every timer tick ~ 10ms)
+            {
+                if vsock_transport.device_mut().has_rx_data() {
+                    if let Some(queue) = vsock_transport.queue(0).cloned() {
+                        vsock_transport.device_mut().sync_rx_queue(&queue);
+                    }
+                    {
+                        let memory = vm.memory_mut().as_mut_slice();
+                        if vsock_transport.device_mut().process_rx(memory) {
+                            vsock_transport.signal_interrupt();
+                            gic.set_pending(32 + DeviceTreeBuilder::VIRTIO_VSOCK_IRQ);
+                            // Inject IRQ to wake up vCPU
+                            let vcpu = vm.vcpu_mut(0).unwrap();
+                            let _ = vcpu.set_pending_interrupt(arm64_interrupt::HV_INTERRUPT_TYPE_IRQ, true);
+                        }
+                    }
+                }
+            }
         }
 
         // Vsock connection logic - attempt after boot complete
@@ -552,10 +604,11 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
 
         // Send test data after connection is established
         if vsock_connected && !vsock_test_sent {
-            println!("\n[HOST] Sending test message to guest...");
+            println!("\n[HOST] Sending JSON ping command to guest daemon...");
 
-            // Build RW (data) packet
-            let test_data = b"Hello from microvm-rs host!";
+            // Build RW (data) packet with JSON command
+            // The daemon expects: {"command": "ping"}\n
+            let test_data = b"{\"command\": \"ping\"}\n";
             let mut pkt = vec![0u8; 44 + test_data.len()];
             // src_cid = HOST (2)
             pkt[0..8].copy_from_slice(&2u64.to_le_bytes());
@@ -599,6 +652,8 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
             vsock_test_sent = true;
         }
 
+        // Note: TX polling is now handled exclusively in QUEUE_NOTIFY to avoid consuming packets early
+
         match exit {
             Ok(VcpuExit::MmioWrite { addr, syndrome, .. }) => {
                 mmio_write_count += 1;
@@ -636,15 +691,38 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
                 } else if gic.contains(addr) {
                     gic.write(addr, value);
                 } else if vsock_transport.contains(addr) {
+                    let offset = addr - vsock_transport.base_addr();
+
+                    // Debug: Track device activation timing
+                    if offset == 0x70 {
+                        // STATUS register write
+                        let elapsed = boot_start.elapsed();
+                        if value & 4 != 0 { // DRIVER_OK
+                            println!("\n[VSOCK-INIT] DRIVER_OK set at {:?} (status=0x{:x})", elapsed, value);
+                        }
+                    }
+                    if offset == 0x44 && value != 0 {
+                        // QUEUE_READY set to 1
+                        let queue_idx = vsock_transport.queue_sel();
+                        let elapsed = boot_start.elapsed();
+                        let queue_name = match queue_idx {
+                            0 => "RX",
+                            1 => "TX",
+                            2 => "EVENT",
+                            _ => "UNKNOWN",
+                        };
+                        println!("\n[VSOCK-INIT] {} queue ready at {:?}", queue_name, elapsed);
+                    }
+
                     vsock_transport.write(addr, value);
 
                     // Check if this is a queue notify (offset 0x50)
-                    let offset = addr - vsock_transport.base_addr();
                     if offset == 0x50 {
-                        // Queue notification - sync queues and process
-                        let queue_sel = vsock_transport.queue_sel() as usize;
-                        if let Some(queue) = vsock_transport.queue(queue_sel).cloned() {
-                            match queue_sel {
+                        // Queue notification - the VALUE written contains the queue index being notified
+                        // Note: This is different from queue_sel which is used for queue configuration
+                        let queue_idx = value as usize;
+                        if let Some(queue) = vsock_transport.queue(queue_idx).cloned() {
+                            match queue_idx {
                                 0 => vsock_transport.device_mut().sync_rx_queue(&queue),
                                 1 => vsock_transport.device_mut().sync_tx_queue(&queue),
                                 2 => vsock_transport.device_mut().sync_event_queue(&queue),
@@ -657,32 +735,124 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
                             let memory = vm.memory_mut().as_mut_slice();
                             vsock_transport.device_mut().process_tx(memory)
                         };
+                        // Let the device handle connection management (REQUEST -> RESPONSE)
+                        // and immediately deliver any responses to avoid timeout
+                        for pkt in &packets {
+                            vsock_transport.device_mut().process_tx_packet(pkt);
+                            // Check if device queued a response - deliver immediately
+                            {
+                                let memory = vm.memory_mut().as_mut_slice();
+                                if vsock_transport.device_mut().process_rx(memory) {
+                                    vsock_transport.signal_interrupt();
+                                    gic.set_pending(32 + DeviceTreeBuilder::VIRTIO_VSOCK_IRQ);
+                                }
+                            }
+                        }
                         for pkt in &packets {
                             if pkt.len() >= 44 {
                                 let op = u16::from_le_bytes([pkt[30], pkt[31]]);
                                 let src_port = u32::from_le_bytes([pkt[16], pkt[17], pkt[18], pkt[19]]);
+                                let dst_port = u32::from_le_bytes([pkt[20], pkt[21], pkt[22], pkt[23]]);
                                 let payload_len = pkt.len() - 44;
-                                match op {
-                                    1 => println!("\n[VSOCK] Guest REQUEST from port {}", src_port),
-                                    2 => {
-                                        // RESPONSE - connection accepted
-                                        println!("\n[VSOCK] Guest RESPONSE from port {} - connection established!", src_port);
-                                        vsock_connected = true;
-                                    }
-                                    3 => println!("\n[VSOCK] Guest RST from port {}", src_port),
-                                    5 => {
-                                        // RW - data from guest
-                                        if payload_len > 0 {
-                                            let data = String::from_utf8_lossy(&pkt[44..]);
-                                            println!("\n[VSOCK] Received {} bytes from guest port {}: {}", payload_len, src_port, data.trim());
+
+                                // Check if this is a proxy connection (port 7601)
+                                if dst_port == PROXY_PORT && op == 5 && payload_len > 0 {
+                                    // Handle proxy packet
+                                    let payload = &pkt[44..];
+                                    if payload.len() >= 13 {
+                                        let pkt_type = payload[0];
+                                        let conn_key = u64::from_le_bytes([
+                                            payload[1], payload[2], payload[3], payload[4],
+                                            payload[5], payload[6], payload[7], payload[8],
+                                        ]);
+                                        let proxy_payload_len = u32::from_le_bytes([
+                                            payload[9], payload[10], payload[11], payload[12],
+                                        ]) as usize;
+
+                                        match pkt_type {
+                                            0x01 => {
+                                                // CONNECT request
+                                                if payload.len() >= 13 + proxy_payload_len {
+                                                    let connect_data = &payload[13..13 + proxy_payload_len];
+                                                    if let Ok(request) = parse_connect_request(connect_data) {
+                                                        let (response, conn_id_opt) = outbound_proxy.handle_connect(
+                                                            &microvm::proxy::ConnectRequest::domain(&request.0, request.1),
+                                                            conn_key,
+                                                        );
+                                                        // Store the mapping from conn_key to guest port
+                                                        // This is needed to route TCP responses back to the right vsock port
+                                                        if conn_id_opt.is_some() {
+                                                            conn_key_to_guest_port.insert(conn_key, src_port);
+                                                        }
+                                                        // Send response back to guest
+                                                        let resp_pkt = build_proxy_response(conn_key, &response);
+                                                        vsock_transport.device_mut().queue_data_packet(
+                                                            GUEST_CID, src_port, PROXY_PORT, &resp_pkt
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            0x03 => {
+                                                // DATA packet - forward to target
+                                                if payload.len() >= 13 + proxy_payload_len {
+                                                    let data = &payload[13..13 + proxy_payload_len];
+                                                    if let Err(e) = outbound_proxy.forward_to_target(conn_key, data) {
+                                                        eprintln!("[PROXY] Forward error: {}", e);
+                                                    }
+                                                }
+                                            }
+                                            0x04 => {
+                                                // CLOSE packet
+                                                outbound_proxy.close_connection(conn_key);
+                                            }
+                                            _ => {}
                                         }
                                     }
-                                    6 => {
-                                        // CREDIT_UPDATE
-                                        println!("\n[VSOCK] Guest CREDIT_UPDATE from port {}", src_port);
+                                } else {
+                                    // Regular vsock packet handling
+                                    match op {
+                                        1 => {
+                                            // CONNECTION REQUEST
+                                            // Note: The vsock device handles REQUEST/RESPONSE via its listener mechanism.
+                                            // We don't need to manually send RESPONSE here - that would cause duplicates.
+                                            println!("\n[VSOCK] Guest REQUEST from port {} to port {}", src_port, dst_port);
+                                            if dst_port == PROXY_PORT {
+                                                println!("[VSOCK] Proxy connection request - device will auto-respond");
+                                            }
+                                        }
+                                        2 => {
+                                            // RESPONSE - connection accepted
+                                            println!("\n[VSOCK] Guest RESPONSE from port {} - connection established!", src_port);
+                                            vsock_connected = true;
+                                        }
+                                        3 => println!("\n[VSOCK] Guest RST from port {}", src_port),
+                                        5 => {
+                                            // RW - data from guest
+                                            if payload_len > 0 {
+                                                let data = String::from_utf8_lossy(&pkt[44..]);
+                                                println!("\n[VSOCK] Received {} bytes from guest port {}: {}", payload_len, src_port, data.trim());
+                                            }
+                                        }
+                                        6 => {
+                                            // CREDIT_UPDATE
+                                            println!("\n[VSOCK] Guest CREDIT_UPDATE from port {}", src_port);
+                                        }
+                                        _ => {}
                                     }
-                                    _ => {}
                                 }
+                            }
+                        }
+
+                        // Poll outbound proxy for incoming data from targets
+                        let proxy_data = outbound_proxy.poll_connections();
+                        for (conn_key, data) in proxy_data {
+                            // Send data back to guest
+                            let data_pkt = build_proxy_data_packet(conn_key, &data);
+                            // Look up the guest's vsock port from our mapping
+                            if let Some(&guest_port) = conn_key_to_guest_port.get(&conn_key) {
+                                vsock_transport.device_mut().queue_data_packet(
+                                    GUEST_CID, guest_port, PROXY_PORT, &data_pkt
+                                );
                             }
                         }
 
@@ -756,8 +926,31 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
             }
             Ok(VcpuExit::Wfi) => {
                 // WFI - Wait For Interrupt.
+                // Poll outbound proxy for incoming TCP data while guest is waiting
+                let proxy_data = outbound_proxy.poll_connections();
+                for (conn_key, data) in proxy_data {
+                    // Send data back to guest via vsock
+                    let data_pkt = build_proxy_data_packet(conn_key, &data);
+                    // Look up the guest's vsock port from our mapping
+                    if let Some(&guest_port) = conn_key_to_guest_port.get(&conn_key) {
+                        vsock_transport.device_mut().queue_data_packet(
+                            GUEST_CID, guest_port, PROXY_PORT, &data_pkt
+                        );
+                    }
+                }
+
+                // Process RX queue (host -> guest) if there's data
+                {
+                    let memory = vm.memory_mut().as_mut_slice();
+                    if vsock_transport.device_mut().process_rx(memory) {
+                        // Packets were delivered, signal interrupt
+                        vsock_transport.signal_interrupt();
+                        gic.set_pending(32 + DeviceTreeBuilder::VIRTIO_VSOCK_IRQ);
+                    }
+                }
+
                 // If an interrupt is pending, inject it and continue
-                // Otherwise, briefly sleep to wait for timer
+                // Otherwise, briefly sleep to wait for timer/IO
                 if gic.get_pending_irq().is_some() {
                     let vcpu = vm.vcpu_mut(0).unwrap();
                     let _ = vcpu.set_pending_interrupt(arm64_interrupt::HV_INTERRUPT_TYPE_IRQ, true);
@@ -909,6 +1102,67 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
     }
 
     println!("\nBoot test completed.");
+}
+
+/// Parse a connect request from the proxy protocol.
+fn parse_connect_request(data: &[u8]) -> Result<(String, u16), &'static str> {
+    if data.len() < 6 {
+        return Err("Connect request too short");
+    }
+
+    let _msg_type = data[0]; // Should be 0x01
+    let addr_type = data[1];
+    let addr_len = u16::from_le_bytes([data[2], data[3]]) as usize;
+
+    if data.len() < 4 + addr_len + 2 {
+        return Err("Connect request truncated");
+    }
+
+    let addr_bytes = &data[4..4 + addr_len];
+    let port = u16::from_le_bytes([data[4 + addr_len], data[4 + addr_len + 1]]);
+
+    let address = match addr_type {
+        0x01 => {
+            // IPv4
+            if addr_len != 4 {
+                return Err("Invalid IPv4 length");
+            }
+            format!("{}.{}.{}.{}", addr_bytes[0], addr_bytes[1], addr_bytes[2], addr_bytes[3])
+        }
+        0x03 => {
+            // Domain
+            String::from_utf8_lossy(addr_bytes).to_string()
+        }
+        _ => return Err("Unknown address type"),
+    };
+
+    Ok((address, port))
+}
+
+/// Build a proxy response packet.
+fn build_proxy_response(conn_key: u64, response: &microvm::proxy::ConnectResponse) -> Vec<u8> {
+    let mut pkt = Vec::with_capacity(13 + 4);
+    // Proxy packet header
+    pkt.push(0x02); // Response type
+    pkt.extend_from_slice(&conn_key.to_le_bytes());
+    pkt.extend_from_slice(&4u32.to_le_bytes()); // Payload length
+    // Response payload
+    pkt.push(0x02); // MessageType::Response
+    pkt.push(response.status as u8);
+    pkt.extend_from_slice(&response.bound_port.to_le_bytes());
+    pkt
+}
+
+/// Build a proxy data packet.
+fn build_proxy_data_packet(conn_key: u64, data: &[u8]) -> Vec<u8> {
+    let mut pkt = Vec::with_capacity(13 + data.len());
+    // Proxy packet header
+    pkt.push(0x03); // Data type
+    pkt.extend_from_slice(&conn_key.to_le_bytes());
+    pkt.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    // Data payload
+    pkt.extend_from_slice(data);
+    pkt
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]

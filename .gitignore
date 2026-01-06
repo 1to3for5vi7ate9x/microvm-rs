@@ -29,7 +29,12 @@ desktop.ini
 vmlinuz*
 initrd*
 test-assets/
-guest/
+
+# Guest directory - track source, ignore binaries and kernel
+guest/kernel/
+guest/*.c
+guest/*_test
+guest/*/target/
 
 # Linux kernel source
 linux-*.tar.xz

@@ -298,19 +298,32 @@ impl LinuxLoader {
 
     /// Load raw kernel at default address.
     fn load_raw(&self, memory: &mut impl MemoryWriter) -> Result<KernelInfo> {
-        // Default load address - use low addresses since our VM memory starts at 0
+        // ARM64: RAM starts at 0x40000000 (1GB), kernel loaded at RAM + 512KB
+        // x86_64: RAM starts at 0, kernel loaded at 1MB
         #[cfg(target_arch = "aarch64")]
-        const LOAD_ADDR: u64 = 0x8_0000; // 512KB - standard ARM64 text_offset
-        #[cfg(target_arch = "x86_64")]
-        const LOAD_ADDR: u64 = 0x100000; // 1MB
-        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-        const LOAD_ADDR: u64 = 0x10000;
+        const RAM_BASE: u64 = 0x4000_0000;
+        #[cfg(target_arch = "aarch64")]
+        const LOAD_OFFSET: u64 = 0x8_0000; // 512KB - standard ARM64 text_offset
 
-        memory.write(LOAD_ADDR as usize, &self.kernel_data)?;
+        #[cfg(target_arch = "x86_64")]
+        const RAM_BASE: u64 = 0;
+        #[cfg(target_arch = "x86_64")]
+        const LOAD_OFFSET: u64 = 0x100000; // 1MB
+
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        const RAM_BASE: u64 = 0;
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        const LOAD_OFFSET: u64 = 0x10000;
+
+        // Write to memory buffer offset (memory buffer starts at RAM_BASE in guest PA space)
+        memory.write(LOAD_OFFSET as usize, &self.kernel_data)?;
+
+        // Entry point is the guest physical address
+        let entry = RAM_BASE + LOAD_OFFSET;
 
         Ok(KernelInfo {
-            entry: LOAD_ADDR,
-            load_addr: LOAD_ADDR,
+            entry,
+            load_addr: entry,
             size: self.kernel_data.len(),
             format: KernelFormat::Raw,
             initrd_start: None,
