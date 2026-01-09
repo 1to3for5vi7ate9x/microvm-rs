@@ -89,7 +89,6 @@ impl std::io::Write for ChannelWriter {
 }
 
 /// Configuration for the VM runtime.
-#[derive(Clone)]
 pub struct RuntimeConfig {
     /// Memory size in megabytes.
     pub memory_mb: u32,
@@ -103,6 +102,8 @@ pub struct RuntimeConfig {
     pub guest_cid: Option<u64>,
     /// Channel for console output (optional).
     pub console_tx: Option<mpsc::Sender<Vec<u8>>>,
+    /// Channel for console input (optional, taken on spawn).
+    pub console_rx: Option<mpsc::Receiver<Vec<u8>>>,
 }
 
 impl std::fmt::Debug for RuntimeConfig {
@@ -114,6 +115,7 @@ impl std::fmt::Debug for RuntimeConfig {
             .field("cmdline", &self.cmdline)
             .field("guest_cid", &self.guest_cid)
             .field("console_tx", &self.console_tx.is_some())
+            .field("console_rx", &self.console_rx.is_some())
             .finish()
     }
 }
@@ -127,6 +129,7 @@ impl Default for RuntimeConfig {
             cmdline: String::new(),
             guest_cid: None,
             console_tx: None,
+            console_rx: None,
         }
     }
 }
@@ -204,10 +207,21 @@ impl VmRuntime {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
         let vsock_rx = self.vsock_rx.take().expect("spawn called twice");
-        let config = self.config.clone();
+        let console_rx = self.config.console_rx.take();
+
+        // Clone the clonable parts of config, move the rest
+        let config = RuntimeConfig {
+            memory_mb: self.config.memory_mb,
+            kernel_path: self.config.kernel_path.clone(),
+            initrd_path: self.config.initrd_path.clone(),
+            cmdline: self.config.cmdline.clone(),
+            guest_cid: self.config.guest_cid,
+            console_tx: self.config.console_tx.clone(),
+            console_rx: None, // Already taken
+        };
 
         let thread_handle = thread::spawn(move || {
-            let result = Self::run_event_loop(config, vsock_rx, cmd_rx);
+            let result = Self::run_event_loop(config, vsock_rx, cmd_rx, console_rx);
             let _ = shutdown_tx.send(result);
         });
 
@@ -224,6 +238,7 @@ impl VmRuntime {
         config: RuntimeConfig,
         vsock_rx: mpsc::Receiver<VsockMessage>,
         mut cmd_rx: mpsc::Receiver<RuntimeCommand>,
+        mut console_rx: Option<mpsc::Receiver<Vec<u8>>>,
     ) -> Result<()> {
         use crate::backend::hvf::bindings::{arm64_reg, arm64_interrupt};
         use crate::backend::hvf::{Vm, VcpuExit};
@@ -356,6 +371,19 @@ impl VmRuntime {
                     break;
                 }
                 Err(_) => {} // No command, continue
+            }
+
+            // Check for console input and forward to UART
+            if let Some(ref mut rx) = console_rx {
+                match rx.try_recv() {
+                    Ok(data) => {
+                        uart.queue_input(&data);
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        console_rx = None; // Channel closed
+                    }
+                }
             }
 
             // Sync vsock queues when device becomes ready (DRIVER_OK)
@@ -752,6 +780,7 @@ impl VmRuntime {
         _config: RuntimeConfig,
         _vsock_rx: mpsc::Receiver<VsockMessage>,
         _cmd_rx: mpsc::Receiver<RuntimeCommand>,
+        _console_rx: Option<mpsc::Receiver<Vec<u8>>>,
     ) -> Result<()> {
         Err(Error::HypervisorNotAvailable)
     }
