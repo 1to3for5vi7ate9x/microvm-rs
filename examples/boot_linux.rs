@@ -96,7 +96,8 @@ fn run_linux_boot(kernel_path: &str, initrd_path: Option<&str>) {
     }
 
     // Set command line - use init=/init to run our init script
-    let loader = loader.with_cmdline("console=ttyAMA0 earlycon=pl011,0x09000000 panic=1 init=/init");
+    // devtmpfs.mount=1 ensures /dev is populated before init runs
+    let loader = loader.with_cmdline("console=ttyAMA0 earlycon=pl011,0x09000000 panic=1 init=/init devtmpfs.mount=1");
 
     // Create VM with enough memory for the kernel and initrd
     println!("\nCreating VM...");
@@ -159,7 +160,7 @@ fn run_linux_boot(kernel_path: &str, initrd_path: Option<&str>) {
         None
     };
 
-    let dtb = microvm::loader::arm64::DeviceTreeBuilder::build_with_devices(
+    let dtb = microvm::loader::arm64::DeviceTreeBuilder::build_with_all_devices(
         1024 * 1024 * 1024, // 1GB
         loader.cmdline(),
         initrd_info.map(|(s, _)| s),
@@ -168,6 +169,7 @@ fn run_linux_boot(kernel_path: &str, initrd_path: Option<&str>) {
         false, // block
         true,  // vsock - for host-guest communication
         false, // net
+        true,  // rng - provides entropy for fast CRNG initialization
     );
 
     // Write DTB to memory (at RAM_BASE + 64KB, before kernel at RAM_BASE + 2MB)
@@ -400,7 +402,7 @@ fn handle_psci_call(function_id: u64) -> u64 {
 fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
     use microvm::backend::hvf::{bindings::{arm64_reg, arm64_interrupt}, vcpu::VcpuExit};
     use microvm::device::{Gic, Pl011, gic::VTIMER_IRQ};
-    use microvm::device::virtio::{VirtioMmioTransport, VirtioVsock};
+    use microvm::device::virtio::{VirtioMmioTransport, VirtioVsock, VirtioRng};
     use microvm::loader::arm64::DeviceTreeBuilder;
     use std::io::Write;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -412,7 +414,7 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
 
     // Create vsock device - guest CID is 3 (host is 2)
     const GUEST_CID: u64 = 3;
-    const VSOCK_PORT: u32 = 7600; // Port where velocitty-daemon listens
+    const VSOCK_PORT: u32 = 1025; // Port where vpn-daemon listens
     const HOST_PORT: u32 = 1234;  // Our local port for the connection
     const PROXY_PORT: u32 = 7601; // Port for outbound proxy
     let vsock = VirtioVsock::new(GUEST_CID);
@@ -423,6 +425,11 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
     vsock_transport.device_mut().listen(HOST_PORT);
     // Host listens on port 7601 for outbound proxy connections
     vsock_transport.device_mut().listen(PROXY_PORT);
+
+    // Create RNG device for fast entropy (eliminates ~15-20s CRNG init delay)
+    let rng = VirtioRng::new();
+    let rng_base = DeviceTreeBuilder::VIRTIO_MMIO_BASE + 4 * DeviceTreeBuilder::VIRTIO_MMIO_SIZE;
+    let mut rng_transport = VirtioMmioTransport::new(rng, rng_base);
 
     // Create outbound proxy for guest networking
     let mut outbound_proxy = microvm::proxy::VsockOutboundProxy::new();
@@ -437,6 +444,9 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
     let mut vsock_test_sent = false;
     let mut boot_complete = false;
     let boot_start = std::time::Instant::now();
+    let mut vsock_last_attempt: Option<std::time::Instant> = None;
+    let mut vsock_retry_count = 0u32;
+    const MAX_VSOCK_RETRIES: u32 = 10;
 
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = Arc::clone(&running);
@@ -542,40 +552,33 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
             }
         }
 
-        // Vsock connection logic - attempt after boot complete
-        if boot_complete && !vsock_connection_sent {
-            // Wait a bit more after boot complete for daemon to be ready
-            if boot_start.elapsed() > std::time::Duration::from_secs(2) {
-                println!("\n[HOST] Initiating vsock connection to guest port {}...", VSOCK_PORT);
+        // Vsock connection logic - attempt after boot complete with retry support
+        // The kernel's CRNG can take 10-20s to initialize which blocks socket() calls
+        let should_attempt_connection = boot_complete && !vsock_connected && vsock_retry_count < MAX_VSOCK_RETRIES && {
+            let min_boot_time = std::time::Duration::from_secs(10);
+            let retry_interval = std::time::Duration::from_secs(2);
 
-                // Build and send CONNECTION REQUEST packet
-                // vsock header: src_cid(8) + dst_cid(8) + src_port(4) + dst_port(4) + len(4) + type(2) + op(2) + flags(4) + buf_alloc(4) + fwd_cnt(4) = 44 bytes
-                let mut pkt = vec![0u8; 44];
-                // src_cid = HOST (2)
-                pkt[0..8].copy_from_slice(&2u64.to_le_bytes());
-                // dst_cid = GUEST (3)
-                pkt[8..16].copy_from_slice(&GUEST_CID.to_le_bytes());
-                // src_port = HOST_PORT
-                pkt[16..20].copy_from_slice(&HOST_PORT.to_le_bytes());
-                // dst_port = VSOCK_PORT (7600)
-                pkt[20..24].copy_from_slice(&VSOCK_PORT.to_le_bytes());
-                // len = 0 (no payload)
-                pkt[24..28].copy_from_slice(&0u32.to_le_bytes());
-                // type = STREAM (1)
-                pkt[28..30].copy_from_slice(&1u16.to_le_bytes());
-                // op = REQUEST (1)
-                pkt[30..32].copy_from_slice(&1u16.to_le_bytes());
-                // flags = 0
-                pkt[32..36].copy_from_slice(&0u32.to_le_bytes());
-                // buf_alloc = 64KB
-                pkt[36..40].copy_from_slice(&(64 * 1024u32).to_le_bytes());
-                // fwd_cnt = 0
-                pkt[40..44].copy_from_slice(&0u32.to_le_bytes());
+            if boot_start.elapsed() < min_boot_time {
+                false // Not enough time since boot
+            } else if let Some(last) = vsock_last_attempt {
+                last.elapsed() > retry_interval // Enough time since last attempt
+            } else {
+                true // First attempt after min boot time
+            }
+        };
 
-                // Queue packet to RX (host->guest)
-                vsock_transport.device_mut().queue_raw_packet(pkt);
+        if should_attempt_connection {
+            vsock_retry_count += 1;
+            vsock_last_attempt = Some(std::time::Instant::now());
 
-                // Sync all queues from transport to device (copy queue data first to avoid borrow issues)
+            eprintln!("\n[HOST] Vsock connection attempt {} to guest port {}...", vsock_retry_count, VSOCK_PORT);
+            let _ = std::io::stderr().flush();
+
+            // Use connect_to_guest() to properly register connection and queue REQUEST
+            if let Err(e) = vsock_transport.device_mut().connect_to_guest(HOST_PORT, VSOCK_PORT) {
+                eprintln!("[HOST] Failed to initiate connection: {}", e);
+            } else {
+                // Sync all queues from transport to device
                 let queues: Vec<_> = (0..3).filter_map(|i| vsock_transport.queue(i).cloned()).collect();
                 for (i, queue) in queues.iter().enumerate() {
                     match i {
@@ -592,13 +595,21 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
                     if vsock_transport.device_mut().process_rx(memory) {
                         vsock_transport.signal_interrupt();
                         gic.set_pending(32 + DeviceTreeBuilder::VIRTIO_VSOCK_IRQ);
-                        println!("[HOST] CONNECTION REQUEST sent to guest");
+                        println!("[HOST] CONNECTION REQUEST #{} sent to guest daemon", vsock_retry_count);
                     } else {
                         println!("[HOST] Could not deliver REQUEST - RX queue not ready");
                     }
                 }
+            }
 
-                vsock_connection_sent = true;
+            vsock_connection_sent = true;
+        }
+
+        // Check if daemon connection is established (guest sent RESPONSE)
+        if vsock_connection_sent && !vsock_connected {
+            if vsock_transport.device_mut().is_connected_to_guest(HOST_PORT, VSOCK_PORT) {
+                println!("\n[HOST] Connection to vpn-daemon established after {} attempts!", vsock_retry_count);
+                vsock_connected = true;
             }
         }
 
@@ -606,34 +617,16 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
         if vsock_connected && !vsock_test_sent {
             println!("\n[HOST] Sending JSON ping command to guest daemon...");
 
-            // Build RW (data) packet with JSON command
-            // The daemon expects: {"command": "ping"}\n
-            let test_data = b"{\"command\": \"ping\"}\n";
-            let mut pkt = vec![0u8; 44 + test_data.len()];
-            // src_cid = HOST (2)
-            pkt[0..8].copy_from_slice(&2u64.to_le_bytes());
-            // dst_cid = GUEST (3)
-            pkt[8..16].copy_from_slice(&GUEST_CID.to_le_bytes());
-            // src_port = HOST_PORT
-            pkt[16..20].copy_from_slice(&HOST_PORT.to_le_bytes());
-            // dst_port = VSOCK_PORT (7600)
-            pkt[20..24].copy_from_slice(&VSOCK_PORT.to_le_bytes());
-            // len = payload length
-            pkt[24..28].copy_from_slice(&(test_data.len() as u32).to_le_bytes());
-            // type = STREAM (1)
-            pkt[28..30].copy_from_slice(&1u16.to_le_bytes());
-            // op = RW (5)
-            pkt[30..32].copy_from_slice(&5u16.to_le_bytes());
-            // flags = 0
-            pkt[32..36].copy_from_slice(&0u32.to_le_bytes());
-            // buf_alloc = 64KB
-            pkt[36..40].copy_from_slice(&(64 * 1024u32).to_le_bytes());
-            // fwd_cnt = 0
-            pkt[40..44].copy_from_slice(&0u32.to_le_bytes());
-            // payload
-            pkt[44..].copy_from_slice(test_data);
+            // The vpn-daemon expects: {"cmd": "ping"}\n
+            let test_data = b"{\"cmd\": \"ping\"}\n";
 
-            vsock_transport.device_mut().queue_raw_packet(pkt);
+            // Use queue_data_packet which handles packet building properly
+            vsock_transport.device_mut().queue_data_packet(
+                GUEST_CID,   // dst_cid
+                VSOCK_PORT,  // dst_port (guest's listening port)
+                HOST_PORT,   // src_port (our local port)
+                test_data,
+            );
 
             // Sync RX queue and deliver
             if let Some(queue) = vsock_transport.queue(0).cloned() {
@@ -645,7 +638,7 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
                 if vsock_transport.device_mut().process_rx(memory) {
                     vsock_transport.signal_interrupt();
                     gic.set_pending(32 + DeviceTreeBuilder::VIRTIO_VSOCK_IRQ);
-                    println!("[HOST] Test message sent to guest!");
+                    println!("[HOST] Test message sent to guest daemon!");
                 }
             }
 
@@ -679,19 +672,26 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
                     // uart.write() already outputs to stdout, no need to print again
                     uart.write(addr, value);
 
-                    // Check for boot complete signal (daemon listening)
-                    // This is a simple heuristic - look for 'L' followed by 'i' (Listening)
-                    if !boot_complete && value as u8 == b'L' {
-                        // Check boot time - if > 0.5s, likely the daemon message
-                        if boot_start.elapsed() > std::time::Duration::from_millis(500) {
+                    // Check for boot complete signal
+                    // Set boot_complete after init messages appear
+                    if !boot_complete {
+                        let elapsed = boot_start.elapsed();
+                        // After 3 seconds, consider boot complete
+                        if elapsed > std::time::Duration::from_secs(3) {
                             boot_complete = true;
-                            println!("\n[HOST] Boot complete detected, will attempt vsock connection...");
+                            eprintln!("\n[HOST] Boot complete at {:?}", elapsed);
+                            let _ = std::io::stderr().flush();
                         }
                     }
                 } else if gic.contains(addr) {
                     gic.write(addr, value);
                 } else if vsock_transport.contains(addr) {
                     let offset = addr - vsock_transport.base_addr();
+
+                    // Debug: Log all vsock MMIO writes
+                    if mmio_write_count < 100 || offset == 0x70 {
+                        eprintln!("[VSOCK-MMIO] Write offset=0x{:x} value=0x{:x}", offset, value);
+                    }
 
                     // Debug: Track device activation timing
                     if offset == 0x70 {
@@ -866,6 +866,28 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
                             }
                         }
                     }
+                } else if rng_transport.contains(addr) {
+                    // VirtIO RNG device
+                    let offset = addr - rng_transport.base_addr();
+                    rng_transport.write(addr, value);
+
+                    // Check if this is a queue notify (offset 0x50)
+                    if offset == 0x50 {
+                        // Sync queue from transport
+                        if let Some(queue) = rng_transport.queue(0).cloned() {
+                            rng_transport.device_mut().sync_req_queue(&queue);
+                        }
+
+                        // Process RNG requests - fill buffers with random data
+                        {
+                            let memory = vm.memory_mut().as_mut_slice();
+                            if rng_transport.device_mut().process_requests(memory) {
+                                // Random data was delivered, signal interrupt
+                                rng_transport.signal_interrupt();
+                                gic.set_pending(32 + DeviceTreeBuilder::VIRTIO_RNG_IRQ);
+                            }
+                        }
+                    }
                 }
                 // Advance PC
                 {
@@ -891,6 +913,8 @@ fn run_vcpu_loop(vm: &mut microvm::backend::hvf::Vm) {
                     gic.read(addr)
                 } else if vsock_transport.contains(addr) {
                     vsock_transport.read(addr)
+                } else if rng_transport.contains(addr) {
+                    rng_transport.read(addr)
                 } else {
                     0
                 };

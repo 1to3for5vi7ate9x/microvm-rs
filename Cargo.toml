@@ -33,6 +33,7 @@ tracing = ["dep:tracing"]
 thiserror = "1.0"
 bitflags = "2.4"
 libc = "0.2"
+tokio = { version = "1", features = ["sync", "time"] }
 
 # Optional dependencies
 serde = { version = "1.0", features = ["derive"], optional = true }

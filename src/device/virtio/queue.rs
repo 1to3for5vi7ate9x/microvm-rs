@@ -78,7 +78,9 @@ pub struct UsedRingEntry {
 /// Virtqueue configuration and state.
 #[derive(Clone)]
 pub struct Queue {
-    /// Queue size (number of descriptors).
+    /// Maximum queue size (for QUEUE_NUM_MAX).
+    pub max_size: u16,
+    /// Configured queue size (number of descriptors).
     pub size: u16,
     /// Whether the queue is ready.
     pub ready: bool,
@@ -98,7 +100,8 @@ impl Queue {
     /// Create a new queue.
     pub fn new(max_size: u16) -> Self {
         Self {
-            size: max_size,
+            max_size,
+            size: max_size, // Start with max, guest can reduce via QUEUE_NUM
             ready: false,
             desc_table: 0,
             avail_ring: 0,
@@ -110,6 +113,7 @@ impl Queue {
 
     /// Reset the queue.
     pub fn reset(&mut self) {
+        self.size = self.max_size; // Reset to max
         self.ready = false;
         self.desc_table = 0;
         self.avail_ring = 0;

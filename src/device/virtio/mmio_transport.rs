@@ -74,6 +74,21 @@ impl<D: VirtioDevice> VirtioMmioTransport<D> {
         self.queues.get(index)
     }
 
+    /// Get all queues (for syncing to device).
+    pub fn queues(&self) -> &[Queue] {
+        &self.queues
+    }
+
+    /// Check if a specific queue is ready.
+    pub fn is_queue_ready(&self, index: usize) -> bool {
+        self.queues.get(index).map(|q| q.ready).unwrap_or(false)
+    }
+
+    /// Check if device is in DRIVER_OK state.
+    pub fn is_driver_ok(&self) -> bool {
+        self.status & status::DRIVER_OK != 0
+    }
+
     /// Get the currently selected queue index.
     pub fn queue_sel(&self) -> u32 {
         self.queue_sel
@@ -107,8 +122,9 @@ impl<D: VirtioDevice> VirtioMmioTransport<D> {
                 }
             }
             mmio::QUEUE_NUM_MAX => {
+                // Return max_size, not the configured size
                 self.current_queue()
-                    .map(|q| q.size as u32)
+                    .map(|q| q.max_size as u32)
                     .unwrap_or(0)
             }
             mmio::QUEUE_READY => {
@@ -140,8 +156,10 @@ impl<D: VirtioDevice> VirtioMmioTransport<D> {
             }
             mmio::DRIVER_FEATURES => {
                 if self.driver_features_sel == 0 {
+                    eprintln!("[VIRTIO] DRIVER_FEATURES_LO set to 0x{:08x} (sel={})", value, self.driver_features_sel);
                     self.driver_features_lo = value;
                 } else {
+                    eprintln!("[VIRTIO] DRIVER_FEATURES_HI set to 0x{:08x} (sel={})", value, self.driver_features_sel);
                     self.driver_features_hi = value;
                 }
             }
@@ -156,13 +174,22 @@ impl<D: VirtioDevice> VirtioMmioTransport<D> {
                 }
             }
             mmio::QUEUE_NUM => {
+                let qsel = self.queue_sel;
                 if let Some(queue) = self.current_queue_mut() {
+                    eprintln!("[VIRTIO] Queue {} QUEUE_NUM set to {} (max={})",
+                              qsel, value, queue.max_size);
                     queue.size = value as u16;
                 }
             }
             mmio::QUEUE_READY => {
+                let qsel = self.queue_sel;
                 if let Some(queue) = self.current_queue_mut() {
                     queue.ready = value != 0;
+                    if queue.ready {
+                        eprintln!("[VIRTIO] Queue {} ready: desc=0x{:x} avail=0x{:x} used=0x{:x} size={}",
+                                  qsel, queue.desc_table, queue.avail_ring,
+                                  queue.used_ring, queue.size);
+                    }
                 }
             }
             mmio::QUEUE_NOTIFY => {
@@ -173,25 +200,37 @@ impl<D: VirtioDevice> VirtioMmioTransport<D> {
                 self.interrupt_status &= !value;
             }
             mmio::STATUS => {
-                self.status = value as u8;
-                if value == 0 {
+                // STATUS is 8-bit, mask to prevent garbage values
+                let new_status = (value & 0xFF) as u8;
+                let old_status = self.status;
+                eprintln!("[VIRTIO] STATUS change: 0x{:02x} -> 0x{:02x} (raw value: 0x{:08x})",
+                          old_status, new_status, value);
+
+                if new_status == 0 {
                     // Reset
+                    eprintln!("[VIRTIO] Device reset");
                     self.device.reset();
                     for queue in &mut self.queues {
                         queue.reset();
                     }
                     self.interrupt_status = 0;
                 }
-                if value & status::FEATURES_OK as u32 != 0 {
-                    // Ack features
+                // Check if FEATURES_OK is being set (transition check)
+                if new_status & status::FEATURES_OK != 0 && old_status & status::FEATURES_OK == 0 {
+                    // Ack features on transition to FEATURES_OK
                     let features = (self.driver_features_hi as u64) << 32
                         | self.driver_features_lo as u64;
+                    eprintln!("[VIRTIO] FEATURES_OK set, acked features: 0x{:016x}", features);
                     self.device.ack_features(features);
                 }
-                if value & status::DRIVER_OK as u32 != 0 {
-                    // Activate device
+                // Check if DRIVER_OK is being set (transition check)
+                if new_status & status::DRIVER_OK != 0 && old_status & status::DRIVER_OK == 0 {
+                    // Activate device on transition to DRIVER_OK
+                    eprintln!("[VIRTIO] DRIVER_OK set, activating device (type={})", self.device.device_type());
                     let _ = self.device.activate();
                 }
+
+                self.status = new_status;
             }
             mmio::QUEUE_DESC_LOW => {
                 if let Some(queue) = self.current_queue_mut() {

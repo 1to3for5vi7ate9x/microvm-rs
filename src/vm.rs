@@ -173,3 +173,10 @@ impl Drop for MicroVM {
         }
     }
 }
+
+// Safety: MicroVM is thread-safe because:
+// - All internal state access is through the backend which implements Send
+// - State modifications are atomic or protected
+// - The hypervisor frameworks (HVF, WHP, KVM) support multi-threaded access
+unsafe impl Send for MicroVM {}
+unsafe impl Sync for MicroVM {}

@@ -27,17 +27,21 @@ mod builder;
 mod error;
 mod vm;
 pub mod runner;
+pub mod runtime;
 
 pub mod backend;
 pub mod device;
 pub mod loader;
 pub mod memory;
 pub mod proxy;
+pub mod vsock;
 
 // Re-exports
 pub use builder::VmBuilder;
 pub use error::{Error, Result};
 pub use vm::{MicroVM, VmState};
+pub use vsock::{VsockClient, VsockConnection, VsockHandler, VsockMessage, create_vsock_channel};
+pub use runtime::{VmRuntime, RuntimeConfig, RuntimeHandle};
 
 /// Check if the current platform supports hardware virtualization.
 ///

@@ -76,6 +76,8 @@ impl DeviceTreeBuilder {
     pub const VIRTIO_VSOCK_IRQ: u32 = 18;
     /// VirtIO network IRQ (SPI).
     pub const VIRTIO_NET_IRQ: u32 = 19;
+    /// VirtIO RNG IRQ (SPI).
+    pub const VIRTIO_RNG_IRQ: u32 = 20;
 
     /// Build a minimal device tree for Linux boot.
     pub fn build_minimal(
@@ -111,6 +113,24 @@ impl DeviceTreeBuilder {
         has_vsock: bool,
         has_net: bool,
     ) -> Vec<u8> {
+        Self::build_with_all_devices(
+            memory_size, cmdline, initrd_start, initrd_end,
+            has_console, has_block, has_vsock, has_net, false,
+        )
+    }
+
+    /// Build a device tree with all VirtIO device options including RNG.
+    pub fn build_with_all_devices(
+        memory_size: u64,
+        cmdline: &str,
+        initrd_start: Option<u64>,
+        initrd_end: Option<u64>,
+        has_console: bool,
+        has_block: bool,
+        has_vsock: bool,
+        has_net: bool,
+        has_rng: bool,
+    ) -> Vec<u8> {
         let mut builder = Self::new();
         let mut devices = Vec::new();
         if has_console {
@@ -124,6 +144,9 @@ impl DeviceTreeBuilder {
         }
         if has_net {
             devices.push((Self::VIRTIO_MMIO_BASE + 3 * Self::VIRTIO_MMIO_SIZE, Self::VIRTIO_NET_IRQ));
+        }
+        if has_rng {
+            devices.push((Self::VIRTIO_MMIO_BASE + 4 * Self::VIRTIO_MMIO_SIZE, Self::VIRTIO_RNG_IRQ));
         }
         builder.build_internal(memory_size, cmdline, initrd_start, initrd_end, &devices)
     }

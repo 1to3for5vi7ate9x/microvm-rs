@@ -195,7 +195,7 @@ impl VirtioVsock {
         self.listeners.remove(&port);
     }
 
-    /// Connect to a port on the host.
+    /// Connect to a port on the host (guest-initiated).
     pub fn connect(&mut self, local_port: u32, peer_port: u32) -> Result<()> {
         let key = ConnKey {
             local_port,
@@ -221,6 +221,52 @@ impl VirtioVsock {
         self.rx_pending.push_back(pkt);
 
         Ok(())
+    }
+
+    /// Connect to a port on the guest (host-initiated).
+    /// This sends a REQUEST from host to guest - guest must have a listener on that port.
+    pub fn connect_to_guest(&mut self, local_port: u32, guest_port: u32) -> Result<()> {
+        let key = ConnKey {
+            local_port,
+            peer_cid: self.guest_cid,
+            peer_port: guest_port,
+        };
+
+        eprintln!("[VSOCK] connect_to_guest: host_port={} -> guest_cid={} guest_port={}",
+                  local_port, self.guest_cid, guest_port);
+
+        // Create connection in Connecting state
+        let conn = VsockConnection::new(local_port, self.guest_cid, guest_port);
+        self.connections.insert(key, conn);
+
+        // Queue REQUEST packet from host to guest
+        let mut pkt = vec![0u8; VsockHeader::SIZE];
+        self.write_response_header(
+            &mut pkt,
+            self.guest_cid,  // dst_cid = guest
+            guest_port,      // dst_port = guest's listening port
+            local_port,      // src_port = host's local port
+            0,
+            pkt_type::STREAM,
+            op::REQUEST,
+        );
+        eprintln!("[VSOCK] Queued REQUEST packet: src_cid=2 dst_cid={} src_port={} dst_port={} op={}",
+                  self.guest_cid, local_port, guest_port, op::REQUEST);
+        self.rx_pending.push_back(pkt);
+
+        Ok(())
+    }
+
+    /// Check if a host-to-guest connection is established.
+    pub fn is_connected_to_guest(&self, local_port: u32, guest_port: u32) -> bool {
+        let key = ConnKey {
+            local_port,
+            peer_cid: self.guest_cid,
+            peer_port: guest_port,
+        };
+        self.connections.get(&key)
+            .map(|c| c.state == ConnState::Connected)
+            .unwrap_or(false)
     }
 
     /// Send data on a connection.
@@ -329,9 +375,14 @@ impl VirtioVsock {
             peer_port: src_port,      // Guest's port
         };
 
+        eprintln!("[VSOCK] TX packet from guest: src_cid={} dst_cid={} src_port={} dst_port={} op={}",
+                  src_cid, dst_cid, src_port, dst_port, op);
+
         match op {
             op::REQUEST => {
                 // Incoming connection request from guest - accept if we have a listener
+                eprintln!("[VSOCK] Guest REQUEST: src_port={} dst_port={} have_listener={}",
+                          src_port, dst_port, self.listeners.contains_key(&dst_port));
                 if self.listeners.contains_key(&dst_port) {
                     let mut conn = VsockConnection::new(dst_port, src_cid, src_port);
                     conn.state = ConnState::Connected;
@@ -354,8 +405,13 @@ impl VirtioVsock {
             }
             op::RESPONSE => {
                 // Connection accepted
+                eprintln!("[VSOCK] Guest RESPONSE: looking for connection local_port={} peer_cid={} peer_port={}",
+                          key.local_port, key.peer_cid, key.peer_port);
                 if let Some(conn) = self.connections.get_mut(&key) {
+                    eprintln!("[VSOCK] Connection ACCEPTED! Transitioning to Connected");
                     conn.state = ConnState::Connected;
+                } else {
+                    eprintln!("[VSOCK] No matching connection found for RESPONSE!");
                 }
             }
             op::RST | op::SHUTDOWN => {
@@ -432,6 +488,12 @@ impl VirtioVsock {
             return false;
         }
 
+        // Only log when there are pending packets but NO available buffers (a problem)
+        if !self.rx_pending.is_empty() && !self.rx_queue.has_available(memory) {
+            eprintln!("[VSOCK] process_rx: {} pending packets, but no available buffers!",
+                      self.rx_pending.len());
+        }
+
         while let Some(pkt) = self.rx_pending.front() {
             // Get an available buffer from the guest
             if let Some((head_idx, desc)) = self.rx_queue.pop_available(memory) {
@@ -447,12 +509,18 @@ impl VirtioVsock {
                     if offset + pkt.len() <= memory.len() {
                         memory[offset..offset + pkt.len()].copy_from_slice(pkt);
                         self.rx_queue.add_used(memory, head_idx, pkt.len() as u32);
+                        // Debug: log packet delivery
+                        if pkt.len() >= 32 {
+                            let op = u16::from_le_bytes([pkt[30], pkt[31]]);
+                            eprintln!("[VSOCK] Delivered packet to guest: op={} len={}", op, pkt.len());
+                        }
                         self.rx_pending.pop_front();
                         delivered = true;
                     }
                 }
             } else {
                 // No more available buffers
+                eprintln!("[VSOCK] No available RX buffers from guest");
                 break;
             }
         }
