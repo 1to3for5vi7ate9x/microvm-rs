@@ -170,6 +170,17 @@ impl Pl011 {
             reg::IMSC => self.imsc,
             reg::RIS => self.ris,
             reg::MIS => self.ris & self.imsc,
+            // PrimeCell ID registers (required for AMBA bus driver)
+            // PID0-3: Peripheral ID (0x00041011 for PL011)
+            0xFE0 => 0x11, // PID0
+            0xFE4 => 0x10, // PID1
+            0xFE8 => 0x14, // PID2 (revision 1, designer 0x41 = ARM)
+            0xFEC => 0x00, // PID3
+            // CID0-3: PrimeCell Component ID (0xB105F00D)
+            0xFF0 => 0x0D, // CID0
+            0xFF4 => 0xF0, // CID1
+            0xFF8 => 0x05, // CID2
+            0xFFC => 0xB1, // CID3
             _ => 0,
         }
     }

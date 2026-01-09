@@ -235,6 +235,8 @@ impl DeviceTreeBuilder {
         self.add_prop_string("clock-names", "uartclk\0apb_pclk");
         // Clocks - reference fixed clock
         self.add_prop_u32_pair("clocks", 2, 2); // phandle 2 for both clocks
+        // ARM PrimeCell peripheral ID for PL011 (helps AMBA bus driver)
+        self.add_prop_u32("arm,primecell-periphid", 0x00041011);
         self.add_prop_string("status", "okay");
         self.add_prop_u32("phandle", 3); // Give uart a phandle too
         self.end_node();
