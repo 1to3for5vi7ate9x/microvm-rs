@@ -141,10 +141,14 @@ impl VsockClient {
         self.tx.send(VsockMessage::Connect {
             guest_port,
             response: response_tx,
-        }).await.map_err(|e| format!("Channel closed: {}", e))?;
+        }).await.map_err(|e| {
+            format!("Channel closed: {}", e)
+        })?;
 
         let assigned_port = response_rx.await
-            .map_err(|e| format!("Response channel closed: {}", e))??;
+            .map_err(|e| {
+                format!("Response channel closed: {}", e)
+            })??;
 
         Ok(VsockConnection {
             local_port: assigned_port,
@@ -167,19 +171,29 @@ impl VsockClient {
         let conn = self.connect(guest_port).await?;
         conn.send(request).await?;
 
-        // Wait a bit for response (simple polling for now)
-        // In production, would use proper async waiting
-        for _ in 0..100 {
+        // Wait for response with timeout that scales with payload size
+        // Base timeout: 5 seconds, plus extra time for large payloads
+        let base_iterations = 500; // 5 seconds base
+        let extra_iterations = request.len() / 1000; // +10ms per KB
+        let max_iterations = base_iterations + extra_iterations;
+
+        for i in 0..max_iterations {
             match conn.recv().await {
-                Ok(data) if !data.is_empty() => return Ok(data),
+                Ok(data) if !data.is_empty() => {
+                    return Ok(data);
+                }
                 Ok(_) => {
                     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    eprintln!("[VSOCK_CLIENT] request error: {}", e);
+                    return Err(e);
+                }
             }
         }
 
-        Err("Timeout waiting for response".to_string())
+        eprintln!("[VSOCK_CLIENT] request TIMEOUT after {}ms", max_iterations * 10);
+        Err(format!("Timeout waiting for response after {}ms", max_iterations * 10))
     }
 }
 
@@ -191,6 +205,8 @@ pub struct VsockHandler {
     rx: mpsc::Receiver<VsockMessage>,
     /// Active connections: (local_port, guest_port) -> pending data
     pending_responses: HashMap<(u32, u32), oneshot::Sender<Result<Vec<u8>, String>>>,
+    /// Buffered data for connections (when data arrives before recv() is called)
+    buffered_data: HashMap<(u32, u32), Vec<Vec<u8>>>,
     /// Next local port
     next_port: u32,
 }
@@ -201,6 +217,7 @@ impl VsockHandler {
         Self {
             rx,
             pending_responses: HashMap::new(),
+            buffered_data: HashMap::new(),
             next_port: 50000,
         }
     }
@@ -218,15 +235,43 @@ impl VsockHandler {
     }
 
     /// Store a pending recv response.
+    /// If there's buffered data for this connection, immediately respond with it.
     pub fn add_pending_recv(&mut self, local_port: u32, guest_port: u32, response: oneshot::Sender<Result<Vec<u8>, String>>) {
-        self.pending_responses.insert((local_port, guest_port), response);
+        let key = (local_port, guest_port);
+
+        // Check if there's buffered data first
+        if let Some(buffer) = self.buffered_data.get_mut(&key) {
+            if !buffer.is_empty() {
+                // Return all buffered data concatenated
+                let data: Vec<u8> = buffer.drain(..).flatten().collect();
+                let _ = response.send(Ok(data));
+                return;
+            }
+        }
+
+        // No buffered data, store the pending response
+        self.pending_responses.insert(key, response);
     }
 
     /// Complete a pending recv with data.
+    /// If no pending recv, buffer the data for later.
     pub fn complete_recv(&mut self, local_port: u32, guest_port: u32, data: Vec<u8>) {
-        if let Some(response) = self.pending_responses.remove(&(local_port, guest_port)) {
+        let key = (local_port, guest_port);
+
+        if let Some(response) = self.pending_responses.remove(&key) {
+            // There's a pending recv, send the data directly
             let _ = response.send(Ok(data));
+        } else {
+            // No pending recv, buffer the data
+            self.buffered_data.entry(key).or_insert_with(Vec::new).push(data);
         }
+    }
+
+    /// Clear buffered data for a closed connection
+    pub fn clear_connection(&mut self, local_port: u32, guest_port: u32) {
+        let key = (local_port, guest_port);
+        self.buffered_data.remove(&key);
+        self.pending_responses.remove(&key);
     }
 }
 
