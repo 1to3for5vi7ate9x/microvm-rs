@@ -24,6 +24,7 @@
 //! - **Linux**: KVM (future)
 
 mod builder;
+pub mod debug;
 mod error;
 mod vm;
 pub mod runner;
@@ -42,6 +43,7 @@ pub use error::{Error, Result};
 pub use vm::{MicroVM, VmState};
 pub use vsock::{VsockClient, VsockConnection, VsockHandler, VsockMessage, create_vsock_channel};
 pub use runtime::{VmRuntime, RuntimeConfig, RuntimeHandle};
+pub use proxy::{ProxyConnectionManager, OUTBOUND_PROXY_PORT};
 
 /// Check if the current platform supports hardware virtualization.
 ///

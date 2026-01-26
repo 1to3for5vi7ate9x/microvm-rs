@@ -1,9 +1,10 @@
 [package]
-name = "socks-test"
+name = "vsock-client"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+libc = "0.2.180"
 
 [profile.release]
 opt-level = "z"

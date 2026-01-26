@@ -23,6 +23,7 @@
 
 use crate::device::VirtioDevice;
 use crate::error::Result;
+use crate::debug_vsock;
 use std::collections::{HashMap, VecDeque};
 
 use super::queue::Queue;
@@ -232,7 +233,7 @@ impl VirtioVsock {
             peer_port: guest_port,
         };
 
-        eprintln!("[VSOCK] connect_to_guest: host_port={} -> guest_cid={} guest_port={}",
+        debug_vsock!("[VSOCK] connect_to_guest: host_port={} -> guest_cid={} guest_port={}",
                   local_port, self.guest_cid, guest_port);
 
         // Create connection in Connecting state
@@ -250,7 +251,7 @@ impl VirtioVsock {
             pkt_type::STREAM,
             op::REQUEST,
         );
-        eprintln!("[VSOCK] Queued REQUEST packet: src_cid=2 dst_cid={} src_port={} dst_port={} op={}",
+        debug_vsock!("[VSOCK] Queued REQUEST packet: src_cid=2 dst_cid={} src_port={} dst_port={} op={}",
                   self.guest_cid, local_port, guest_port, op::REQUEST);
         self.rx_pending.push_back(pkt);
 
@@ -375,13 +376,13 @@ impl VirtioVsock {
             peer_port: src_port,      // Guest's port
         };
 
-        eprintln!("[VSOCK] TX packet from guest: src_cid={} dst_cid={} src_port={} dst_port={} op={}",
+        debug_vsock!("[VSOCK] TX packet from guest: src_cid={} dst_cid={} src_port={} dst_port={} op={}",
                   src_cid, dst_cid, src_port, dst_port, op);
 
         match op {
             op::REQUEST => {
                 // Incoming connection request from guest - accept if we have a listener
-                eprintln!("[VSOCK] Guest REQUEST: src_port={} dst_port={} have_listener={}",
+                debug_vsock!("[VSOCK] Guest REQUEST: src_port={} dst_port={} have_listener={}",
                           src_port, dst_port, self.listeners.contains_key(&dst_port));
                 if self.listeners.contains_key(&dst_port) {
                     let mut conn = VsockConnection::new(dst_port, src_cid, src_port);
@@ -405,13 +406,13 @@ impl VirtioVsock {
             }
             op::RESPONSE => {
                 // Connection accepted
-                eprintln!("[VSOCK] Guest RESPONSE: looking for connection local_port={} peer_cid={} peer_port={}",
+                debug_vsock!("[VSOCK] Guest RESPONSE: looking for connection local_port={} peer_cid={} peer_port={}",
                           key.local_port, key.peer_cid, key.peer_port);
                 if let Some(conn) = self.connections.get_mut(&key) {
-                    eprintln!("[VSOCK] Connection ACCEPTED! Transitioning to Connected");
+                    debug_vsock!("[VSOCK] Connection ACCEPTED! Transitioning to Connected");
                     conn.state = ConnState::Connected;
                 } else {
-                    eprintln!("[VSOCK] No matching connection found for RESPONSE!");
+                    debug_vsock!("[VSOCK] No matching connection found for RESPONSE!");
                 }
             }
             op::RST | op::SHUTDOWN => {
@@ -480,49 +481,116 @@ impl VirtioVsock {
 
     /// Process RX queue - send pending packets to guest.
     /// Returns true if any packets were delivered.
+    /// Supports descriptor chains for large packets.
     pub fn process_rx(&mut self, memory: &mut [u8]) -> bool {
+        static LOGGED_STUCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
         let mut delivered = false;
+        let mut delivered_count = 0;
 
         // Don't process if queue isn't ready
         if !self.rx_queue.ready {
             return false;
         }
 
-        // Only log when there are pending packets but NO available buffers (a problem)
-        if !self.rx_pending.is_empty() && !self.rx_queue.has_available(memory) {
-            eprintln!("[VSOCK] process_rx: {} pending packets, but no available buffers!",
-                      self.rx_pending.len());
-        }
-
         while let Some(pkt) = self.rx_pending.front() {
             // Get an available buffer from the guest
-            if let Some((head_idx, desc)) = self.rx_queue.pop_available(memory) {
-                if !desc.is_write_only() || (desc.len as usize) < pkt.len() {
-                    // Buffer not suitable, skip
+            if let Some((head_idx, first_desc)) = self.rx_queue.pop_available(memory) {
+                // Walk the descriptor chain to calculate total capacity
+                let mut total_capacity: usize = 0;
+                let mut chain: Vec<super::queue::Descriptor> = Vec::new();
+                let mut current_desc = first_desc;
+
+                loop {
+                    if current_desc.is_write_only() {
+                        total_capacity += current_desc.len as usize;
+                        chain.push(current_desc);
+                    }
+
+                    if current_desc.has_next() {
+                        if let Some(next_desc) = self.rx_queue.read_descriptor(memory, current_desc.next) {
+                            current_desc = next_desc;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+
+                if total_capacity < pkt.len() {
+                    // Chain doesn't have enough space, skip (will log in exhausted block)
                     self.rx_queue.add_used(memory, head_idx, 0);
                     continue;
                 }
 
-                // Write packet to guest buffer
-                let offset = super::queue::gpa_to_offset(desc.addr);
-                if let Some(offset) = offset {
-                    if offset + pkt.len() <= memory.len() {
-                        memory[offset..offset + pkt.len()].copy_from_slice(pkt);
-                        self.rx_queue.add_used(memory, head_idx, pkt.len() as u32);
-                        // Debug: log packet delivery
-                        if pkt.len() >= 32 {
-                            let op = u16::from_le_bytes([pkt[30], pkt[31]]);
-                            eprintln!("[VSOCK] Delivered packet to guest: op={} len={}", op, pkt.len());
+                // Write packet across the descriptor chain
+                let mut pkt_offset = 0;
+                let mut write_success = true;
+
+                for desc in &chain {
+                    if pkt_offset >= pkt.len() {
+                        break;
+                    }
+
+                    let bytes_to_write = std::cmp::min(desc.len as usize, pkt.len() - pkt_offset);
+                    let mem_offset = super::queue::gpa_to_offset(desc.addr);
+
+                    if let Some(offset) = mem_offset {
+                        if offset + bytes_to_write <= memory.len() {
+                            memory[offset..offset + bytes_to_write]
+                                .copy_from_slice(&pkt[pkt_offset..pkt_offset + bytes_to_write]);
+                            pkt_offset += bytes_to_write;
+                        } else {
+                            write_success = false;
+                            break;
                         }
-                        self.rx_pending.pop_front();
-                        delivered = true;
+                    } else {
+                        write_success = false;
+                        break;
                     }
                 }
+
+                if write_success && pkt_offset == pkt.len() {
+                    self.rx_queue.add_used(memory, head_idx, pkt.len() as u32);
+                    self.rx_pending.pop_front();
+                    delivered = true;
+                    delivered_count += 1;
+                } else {
+                    self.rx_queue.add_used(memory, head_idx, 0);
+                }
             } else {
-                // No more available buffers
-                eprintln!("[VSOCK] No available RX buffers from guest");
+                // No more available buffers - log diagnostic info once
+                if !LOGGED_STUCK.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    // Read avail ring index from guest memory
+                    let avail_idx = if self.rx_queue.avail_ring >= super::queue::RAM_BASE {
+                        let offset = (self.rx_queue.avail_ring - super::queue::RAM_BASE) as usize + 2;
+                        if offset + 2 <= memory.len() {
+                            u16::from_le_bytes([memory[offset], memory[offset + 1]])
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
+                    eprintln!("[VSOCK] RX BUFFERS EXHAUSTED - diagnostic info:");
+                    eprintln!("[VSOCK]   rx_pending: {} packets", self.rx_pending.len());
+                    eprintln!("[VSOCK]   rx_queue.ready: {}", self.rx_queue.ready);
+                    eprintln!("[VSOCK]   rx_queue.size: {}", self.rx_queue.size);
+                    eprintln!("[VSOCK]   rx_queue.last_avail_idx: {}", self.rx_queue.last_avail_idx);
+                    eprintln!("[VSOCK]   guest avail_idx: {}", avail_idx);
+                    eprintln!("[VSOCK]   rx_queue.avail_ring: 0x{:x}", self.rx_queue.avail_ring);
+                    if let Some(pkt) = self.rx_pending.front() {
+                        eprintln!("[VSOCK]   first pending packet size: {} bytes", pkt.len());
+                    }
+                }
                 break;
             }
+        }
+
+        // Reset the stuck flag if we successfully delivered
+        if delivered_count > 0 {
+            LOGGED_STUCK.store(false, std::sync::atomic::Ordering::SeqCst);
         }
 
         if delivered {
@@ -648,20 +716,40 @@ impl VirtioVsock {
     }
 
     /// Queue a data packet to send to the guest (from host).
+    /// Large payloads are chunked to fit in guest virtqueue buffers.
+    /// Each chunk is a separate vsock RW packet that the guest reassembles at the socket layer.
     pub fn queue_data_packet(&mut self, dst_cid: u64, dst_port: u32, src_port: u32, data: &[u8]) {
-        let mut pkt = vec![0u8; VsockHeader::SIZE + data.len()];
-        // Use response header since host is sending to guest
-        self.write_response_header(
-            &mut pkt,
-            dst_cid,
-            dst_port,
-            src_port,
-            data.len() as u32,
-            pkt_type::STREAM,
-            op::RW,
-        );
-        pkt[VsockHeader::SIZE..].copy_from_slice(data);
-        self.rx_pending.push_back(pkt);
+        // Guest vsock buffers are 3776 bytes (VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE + headroom).
+        // With 44-byte vsock header, max payload per packet is 3732 bytes.
+        // Use 3700 to leave room for any alignment overhead.
+        const MAX_PAYLOAD_PER_CHUNK: usize = 3700;
+
+        if data.is_empty() {
+            return;
+        }
+
+        let num_chunks = (data.len() + MAX_PAYLOAD_PER_CHUNK - 1) / MAX_PAYLOAD_PER_CHUNK;
+
+        let mut offset = 0;
+        while offset < data.len() {
+            let chunk_len = std::cmp::min(MAX_PAYLOAD_PER_CHUNK, data.len() - offset);
+            let chunk = &data[offset..offset + chunk_len];
+
+            let mut pkt = vec![0u8; VsockHeader::SIZE + chunk_len];
+            self.write_response_header(
+                &mut pkt,
+                dst_cid,
+                dst_port,
+                src_port,
+                chunk_len as u32,
+                pkt_type::STREAM,
+                op::RW,
+            );
+            pkt[VsockHeader::SIZE..].copy_from_slice(chunk);
+            self.rx_pending.push_back(pkt);
+
+            offset += chunk_len;
+        }
     }
 
     /// Process echo - for any connection with pending rx data, echo it back.

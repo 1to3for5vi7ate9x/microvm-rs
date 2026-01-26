@@ -26,6 +26,8 @@ use crate::error::Result;
 
 pub use memory::GuestMemory;
 pub use vcpu::{Vcpu, VcpuExit};
+#[cfg(target_arch = "aarch64")]
+pub use vcpu::VcpuExitHandle;
 pub use vm::Vm;
 
 /// Check if Hypervisor.framework is available.

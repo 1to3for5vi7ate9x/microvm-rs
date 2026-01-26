@@ -240,6 +240,20 @@ impl Vcpu {
         hv_result(ret)
     }
 
+    /// Get a handle for forcing vCPU exit from another thread.
+    #[cfg(target_arch = "aarch64")]
+    pub fn get_exit_handle(&self) -> VcpuExitHandle {
+        VcpuExitHandle { handle: self.handle }
+    }
+
+    /// Force the vCPU to exit from hv_vcpu_run().
+    /// This can be called from another thread to interrupt a blocking run.
+    #[cfg(target_arch = "aarch64")]
+    pub fn force_exit(&self) -> Result<()> {
+        let ret = unsafe { bindings::hv_vcpus_exit(&self.handle as *const _, 1) };
+        hv_result(ret)
+    }
+
     /// Read a system register value (ARM64).
     #[cfg(target_arch = "aarch64")]
     pub fn read_sys_register(&self, reg: bindings::hv_sys_reg_t) -> Result<u64> {
@@ -425,5 +439,29 @@ impl Drop for Vcpu {
                 bindings::hv_vcpu_destroy(self.handle);
             }
         }
+    }
+}
+
+/// Handle for forcing vCPU exit from another thread.
+/// This is safe to send between threads as it only contains
+/// the vCPU handle which is stable for the lifetime of the vCPU.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+pub struct VcpuExitHandle {
+    handle: bindings::hv_vcpu_t,
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe impl Send for VcpuExitHandle {}
+#[cfg(target_arch = "aarch64")]
+unsafe impl Sync for VcpuExitHandle {}
+
+#[cfg(target_arch = "aarch64")]
+impl VcpuExitHandle {
+    /// Force the vCPU to exit from hv_vcpu_run().
+    /// Can be called from any thread to interrupt a blocking run.
+    pub fn force_exit(&self) -> Result<()> {
+        let ret = unsafe { bindings::hv_vcpus_exit(&self.handle as *const _, 1) };
+        hv_result(ret)
     }
 }

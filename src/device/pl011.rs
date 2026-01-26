@@ -103,7 +103,7 @@ impl Pl011 {
             cr: cr::TXE | cr::RXE, // TX and RX enabled by default
             imsc: 0,
             ris: 0,
-            rx_fifo: VecDeque::with_capacity(16),
+            rx_fifo: VecDeque::with_capacity(4096),
             output,
         }
     }
@@ -119,13 +119,24 @@ impl Pl011 {
     }
 
     /// Queue input data (from host to guest).
+    /// Buffer size is 4096 bytes to allow for larger pastes.
     pub fn queue_input(&mut self, data: &[u8]) {
         for &byte in data {
-            if self.rx_fifo.len() < 16 {
+            if self.rx_fifo.len() < 4096 {
                 self.rx_fifo.push_back(byte);
             }
         }
         self.update_flags();
+        // Set RXIS (receive interrupt status) bit when data is available
+        // This is bit 4 in the RIS register
+        if !self.rx_fifo.is_empty() {
+            self.ris |= 0x10; // RXIS bit
+        }
+    }
+
+    /// Check if an RX interrupt is pending (for polling by host).
+    pub fn has_rx_interrupt(&self) -> bool {
+        (self.ris & self.imsc & 0x10) != 0
     }
 
     /// Update flag register based on FIFO state.
@@ -136,7 +147,7 @@ impl Pl011 {
             self.fr &= !fr::RXFF;
         } else {
             self.fr &= !fr::RXFE;
-            if self.rx_fifo.len() >= 16 {
+            if self.rx_fifo.len() >= 4096 {
                 self.fr |= fr::RXFF;
             }
         }
@@ -156,6 +167,10 @@ impl Pl011 {
                 // Read from receive FIFO
                 if let Some(byte) = self.rx_fifo.pop_front() {
                     self.update_flags();
+                    // Clear RXIS when FIFO becomes empty
+                    if self.rx_fifo.is_empty() {
+                        self.ris &= !0x10; // Clear RXIS bit
+                    }
                     byte as u32
                 } else {
                     0

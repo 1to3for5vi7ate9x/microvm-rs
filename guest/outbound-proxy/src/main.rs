@@ -160,8 +160,10 @@ fn handle_socks5_client(mut client: TcpStream, vsock_port: u32) -> io::Result<()
     // SOCKS5 greeting
     let mut greeting = [0u8; 2];
     client.read_exact(&mut greeting)?;
+    eprintln!("[PROXY] Greeting bytes: {:02x} {:02x}", greeting[0], greeting[1]);
 
     if greeting[0] != 0x05 {
+        eprintln!("[PROXY] Not SOCKS5: expected 0x05, got 0x{:02x}", greeting[0]);
         return Err(io::Error::new(io::ErrorKind::InvalidData, "Not SOCKS5"));
     }
 
@@ -175,9 +177,13 @@ fn handle_socks5_client(mut client: TcpStream, vsock_port: u32) -> io::Result<()
     // SOCKS5 request
     let mut request = [0u8; 4];
     client.read_exact(&mut request)?;
+    eprintln!("[PROXY] Request bytes: {:02x} {:02x} {:02x} {:02x} (ver={}, cmd={}, atyp={})",
+             request[0], request[1], request[2], request[3],
+             request[0], request[1], request[3]);
 
     if request[0] != 0x05 || request[1] != 0x01 {
-        // Only CONNECT supported
+        // Only CONNECT (0x01) supported, not BIND (0x02) or UDP ASSOCIATE (0x03)
+        eprintln!("[PROXY] Unsupported command: {} (expected 0x01 CONNECT)", request[1]);
         client.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])?;
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "Only CONNECT supported"));
     }
@@ -297,14 +303,22 @@ fn handle_socks5_client(mut client: TcpStream, vsock_port: u32) -> io::Result<()
 
     let mut client_buf = [0u8; 8192];
     let mut vsock_header_buf = [0u8; ProxyPacket::HEADER_SIZE];
+    let mut loop_count: u64 = 0;
+
+    eprintln!("[PROXY] Connection {} entering relay loop", conn_id);
 
     loop {
+        loop_count += 1;
+        if loop_count % 10000 == 0 {
+            eprintln!("[PROXY] Connection {} relay loop iteration {}", conn_id, loop_count);
+        }
         let mut activity = false;
 
         // Read from client, send to vsock
         match client.read(&mut client_buf) {
             Ok(0) => {
                 // Client closed
+                eprintln!("[PROXY] Connection {} client closed (read returned 0)", conn_id);
                 break;
             }
             Ok(n) => {
@@ -324,19 +338,48 @@ fn handle_socks5_client(mut client: TcpStream, vsock_port: u32) -> io::Result<()
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-            Err(_) => break,
+            Err(e) => {
+                eprintln!("[PROXY] Connection {} client read error: {}", conn_id, e);
+                break;
+            }
         }
 
         // Read from vsock, send to client
-        let n = unsafe {
-            libc::read(
-                vsock_fd,
-                vsock_header_buf.as_mut_ptr() as *mut libc::c_void,
-                vsock_header_buf.len(),
-            )
-        };
+        // First, read the complete header (13 bytes) with retry for partial reads
+        let mut header_read = 0;
+        let mut header_retries = 0;
+        while header_read < vsock_header_buf.len() && header_retries < 50 {
+            let n = unsafe {
+                libc::read(
+                    vsock_fd,
+                    vsock_header_buf[header_read..].as_mut_ptr() as *mut libc::c_void,
+                    vsock_header_buf.len() - header_read,
+                )
+            };
+            if n > 0 {
+                header_read += n as usize;
+                header_retries = 0;
+            } else if n == 0 {
+                eprintln!("[PROXY] Connection {} vsock EOF during header read (header_read={})", conn_id, header_read);
+                break; // EOF
+            } else {
+                let errno = unsafe { *libc::__errno_location() };
+                if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                    if header_read == 0 {
+                        // No data at all, break out and continue loop
+                        break;
+                    }
+                    // Partial read, wait for more
+                    header_retries += 1;
+                    thread::sleep(Duration::from_micros(100));
+                } else {
+                    eprintln!("[PROXY] Connection {} vsock read error: errno={}", conn_id, errno);
+                    break; // Real error
+                }
+            }
+        }
 
-        if n > 0 {
+        if header_read == vsock_header_buf.len() {
             activity = true;
             if let Ok(pkt) = ProxyPacket::decode(&vsock_header_buf) {
                 match pkt.pkt_type {
@@ -373,18 +416,11 @@ fn handle_socks5_client(mut client: TcpStream, vsock_port: u32) -> io::Result<()
                         }
                     }
                     PacketType::Close => {
+                        eprintln!("[PROXY] Connection {} received CLOSE from host", conn_id);
                         break;
                     }
                     _ => {}
                 }
-            }
-        } else if n == 0 {
-            break;
-        } else {
-            // n < 0: check for EAGAIN (just continue on would-block)
-            let errno = unsafe { *libc::__errno_location() };
-            if errno != libc::EAGAIN && errno != libc::EWOULDBLOCK {
-                break; // Real error
             }
         }
 
@@ -405,15 +441,43 @@ fn handle_socks5_client(mut client: TcpStream, vsock_port: u32) -> io::Result<()
         libc::close(vsock_fd);
     }
 
-    eprintln!("[PROXY] Connection {} closed", conn_id);
+    eprintln!("[PROXY] Connection {} closed after {} iterations", conn_id, loop_count);
     Ok(())
 }
 
+/// Test vsock connectivity by connecting to host proxy port
+fn test_vsock_connectivity() {
+    use std::io::Write as _;
+    let _ = writeln!(io::stderr(), "[PROXY] Testing vsock connectivity to host proxy (CID={}, port={})...", HOST_CID, DEFAULT_VSOCK_PORT);
+    let _ = io::stderr().flush();
+
+    // Just test that we can connect to the host proxy port
+    match connect_vsock(HOST_CID, DEFAULT_VSOCK_PORT) {
+        Ok(fd) => {
+            let _ = writeln!(io::stderr(), "[PROXY] Vsock to host proxy port {} - OK", DEFAULT_VSOCK_PORT);
+            let _ = io::stderr().flush();
+            unsafe { libc::close(fd) };
+        }
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "[PROXY] Vsock to host proxy port {} - FAILED: {}", DEFAULT_VSOCK_PORT, e);
+            let _ = io::stderr().flush();
+        }
+    }
+}
+
 fn main() -> io::Result<()> {
+    // Very early startup log - before anything else
+    {
+        use std::io::Write as _;
+        let _ = writeln!(io::stderr(), "[PROXY] === OUTBOUND-PROXY STARTING ===");
+        let _ = io::stderr().flush();
+    }
+
     let args: Vec<String> = std::env::args().collect();
 
     let mut listen_addr = "127.0.0.1:1080".to_string();
     let mut vsock_port = DEFAULT_VSOCK_PORT;
+    let mut test_vsock = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -434,6 +498,10 @@ fn main() -> io::Result<()> {
                     i += 1;
                 }
             }
+            "--test" | "-t" => {
+                test_vsock = true;
+                i += 1;
+            }
             _ => i += 1,
         }
     }
@@ -445,7 +513,41 @@ fn main() -> io::Result<()> {
     let _ = writeln!(io::stderr(), "[PROXY] Vsock host port: {}", vsock_port);
     let _ = io::stderr().flush();
 
-    let listener = TcpListener::bind(&listen_addr)?;
+    // Always test vsock connectivity on startup
+    test_vsock_connectivity();
+
+    // If --test flag, also test the proxy port specifically
+    if test_vsock {
+        let _ = writeln!(io::stderr(), "[PROXY] Testing vsock to proxy port {}...", vsock_port);
+        let _ = io::stderr().flush();
+        match connect_vsock(HOST_CID, vsock_port) {
+            Ok(fd) => {
+                let _ = writeln!(io::stderr(), "[PROXY] Proxy port {} reachable!", vsock_port);
+                unsafe { libc::close(fd) };
+            }
+            Err(e) => {
+                let _ = writeln!(io::stderr(), "[PROXY] Proxy port {} FAILED: {}", vsock_port, e);
+            }
+        }
+        let _ = io::stderr().flush();
+    }
+
+    let _ = writeln!(io::stderr(), "[PROXY] Attempting to bind to {}...", listen_addr);
+    let _ = io::stderr().flush();
+
+    let listener = match TcpListener::bind(&listen_addr) {
+        Ok(l) => {
+            let _ = writeln!(io::stderr(), "[PROXY] Successfully bound to {}", listen_addr);
+            let _ = io::stderr().flush();
+            l
+        }
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "[PROXY] FAILED to bind to {}: {}", listen_addr, e);
+            let _ = io::stderr().flush();
+            return Err(e);
+        }
+    };
+
     let _ = writeln!(io::stderr(), "[PROXY] Listening on {}", listen_addr);
     let _ = io::stderr().flush();
 
@@ -454,8 +556,13 @@ fn main() -> io::Result<()> {
             Ok(client) => {
                 let port = vsock_port;
                 thread::spawn(move || {
-                    if let Err(e) = handle_socks5_client(client, port) {
-                        eprintln!("[PROXY] Error: {}", e);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        handle_socks5_client(client, port)
+                    }));
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => eprintln!("[PROXY] Error: {}", e),
+                        Err(panic) => eprintln!("[PROXY] PANIC in connection handler: {:?}", panic),
                     }
                 });
             }

@@ -47,6 +47,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{Error, Result};
 use crate::vsock::{VsockClient, VsockHandler, VsockMessage};
+use crate::proxy::{ProxyConnectionManager, OUTBOUND_PROXY_PORT};
+use crate::{debug_runtime, debug_vsock};
 
 /// A writer that sends output through a channel
 struct ChannelWriter {
@@ -288,7 +290,7 @@ impl VmRuntime {
             loader.load(&mut wrapper)?
         };
 
-        eprintln!("[RUNTIME] Kernel loaded at 0x{:x}, entry 0x{:x}", kernel_info.load_addr, kernel_info.entry);
+        debug_runtime!("[RUNTIME] Kernel loaded at 0x{:x}, entry 0x{:x}", kernel_info.load_addr, kernel_info.entry);
 
         // Create devices
         let mut uart = if let Some(tx) = config.console_tx.clone() {
@@ -308,9 +310,17 @@ impl VmRuntime {
         const HOST_PORT: u32 = 1234;
         const DAEMON_PORT: u32 = 1025;
         vsock_transport.device_mut().listen(HOST_PORT);
+        vsock_transport.device_mut().listen(OUTBOUND_PROXY_PORT);
+        debug_runtime!("[RUNTIME] Listening on vsock ports: {} (host), {} (proxy)", HOST_PORT, OUTBOUND_PROXY_PORT);
 
         // Create vsock handler
         let mut vsock_handler = VsockHandler::new(vsock_rx);
+
+        // Create proxy connection manager for outbound internet access
+        let mut proxy_manager = ProxyConnectionManager::new();
+
+        // Map proxy conn_key to vsock peer_port for routing responses
+        let mut proxy_conn_to_vsock_port: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
 
         // Build device tree
         let memory_size = (config.memory_mb as u64) * 1024 * 1024;
@@ -355,18 +365,36 @@ impl VmRuntime {
         let mut last_timer_inject = Instant::now();
         const TIMER_INTERVAL_MS: u64 = 10; // Inject timer every 10ms (100 Hz)
 
-        eprintln!("[RUNTIME] VM started, entering run loop");
+        debug_runtime!("[RUNTIME] VM started, entering run loop");
+
+        // Get a handle for forcing vCPU exit from the timer thread
+        let vcpu_exit_handle = {
+            let vcpu = vm.vcpu_mut(0).ok_or(Error::DeviceError("No vCPU".into()))?;
+            vcpu.get_exit_handle()
+        };
+
+        // Spawn a timer thread that periodically forces vCPU exit
+        // This ensures vcpu.run() returns even when guest is CPU-bound
+        let timer_running = running.clone();
+        let timer_handle = std::thread::spawn(move || {
+            while timer_running.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(10)); // 100 Hz
+                if timer_running.load(Ordering::Relaxed) {
+                    let _ = vcpu_exit_handle.force_exit();
+                }
+            }
+        });
 
         while running.load(Ordering::Relaxed) {
             // Check for commands (non-blocking)
             match cmd_rx.try_recv() {
                 Ok(RuntimeCommand::Shutdown) => {
-                    eprintln!("[RUNTIME] Shutdown requested");
+                    debug_runtime!("[RUNTIME] Shutdown requested");
                     running.store(false, Ordering::Relaxed);
                     break;
                 }
                 Ok(RuntimeCommand::Kill) => {
-                    eprintln!("[RUNTIME] Kill requested");
+                    debug_runtime!("[RUNTIME] Kill requested");
                     running.store(false, Ordering::Relaxed);
                     break;
                 }
@@ -374,13 +402,20 @@ impl VmRuntime {
             }
 
             // Check for console input and forward to UART
+            // UART IRQ is SPI 1 = 32 + 1 = 33 (defined in device tree)
+            const UART_IRQ: u32 = 33;
             if let Some(ref mut rx) = console_rx {
                 match rx.try_recv() {
                     Ok(data) => {
+                        debug_runtime!("[CONSOLE_INPUT] Received {} bytes: {:?}", data.len(),
+                                  String::from_utf8_lossy(&data));
                         uart.queue_input(&data);
+                        // Signal UART RX interrupt so the kernel's tty driver reads the data
+                        gic.set_pending(UART_IRQ);
                     }
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        debug_runtime!("[CONSOLE_INPUT] Channel disconnected");
                         console_rx = None; // Channel closed
                     }
                 }
@@ -392,24 +427,24 @@ impl VmRuntime {
                 if vsock_transport.is_queue_ready(0) &&
                    vsock_transport.is_queue_ready(1) &&
                    vsock_transport.is_queue_ready(2) {
-                    eprintln!("[RUNTIME] Syncing vsock queues...");
+                    debug_runtime!("[RUNTIME] Syncing vsock queues...");
                     if let Some(q) = vsock_transport.queue(0).cloned() {
-                        eprintln!("[RUNTIME] RX queue (0): desc=0x{:x} avail=0x{:x} used=0x{:x} size={} ready={}",
+                        debug_runtime!("[RUNTIME] RX queue (0): desc=0x{:x} avail=0x{:x} used=0x{:x} size={} ready={}",
                                   q.desc_table, q.avail_ring, q.used_ring, q.size, q.ready);
                         vsock_transport.device_mut().sync_rx_queue(&q);
                     }
                     if let Some(q) = vsock_transport.queue(1).cloned() {
-                        eprintln!("[RUNTIME] TX queue (1): desc=0x{:x} avail=0x{:x} used=0x{:x} size={} ready={}",
+                        debug_runtime!("[RUNTIME] TX queue (1): desc=0x{:x} avail=0x{:x} used=0x{:x} size={} ready={}",
                                   q.desc_table, q.avail_ring, q.used_ring, q.size, q.ready);
                         vsock_transport.device_mut().sync_tx_queue(&q);
                     }
                     if let Some(q) = vsock_transport.queue(2).cloned() {
-                        eprintln!("[RUNTIME] Event queue (2): desc=0x{:x} avail=0x{:x} used=0x{:x} size={} ready={}",
+                        debug_runtime!("[RUNTIME] Event queue (2): desc=0x{:x} avail=0x{:x} used=0x{:x} size={} ready={}",
                                   q.desc_table, q.avail_ring, q.used_ring, q.size, q.ready);
                         vsock_transport.device_mut().sync_event_queue(&q);
                     }
                     vsock_queues_synced = true;
-                    eprintln!("[RUNTIME] Vsock queues synced and ready");
+                    debug_runtime!("[RUNTIME] Vsock queues synced and ready");
                 }
             }
 
@@ -437,7 +472,7 @@ impl VmRuntime {
                             vsock_transport.device_mut().process_tx(memory)
                         };
 
-                        // Check for data packets to deliver to pending recvs
+                        // Check for data packets to deliver to pending recvs or proxy
                         for pkt in &packets {
                             if pkt.len() >= 44 {
                                 let op = u16::from_le_bytes([pkt[30], pkt[31]]);
@@ -447,12 +482,66 @@ impl VmRuntime {
                                 if op == 5 { // RW
                                     let payload = &pkt[44..];
                                     if !payload.is_empty() {
-                                        // Use dst_port (host's local port) not HOST_PORT
-                                        eprintln!("[VSOCK] RW packet: src_port={} dst_port={} payload_len={}",
-                                                  src_port, dst_port, payload.len());
-                                        vsock_handler.complete_recv(dst_port, src_port, payload.to_vec());
+                                        // Route based on destination port
+                                        if dst_port == OUTBOUND_PROXY_PORT {
+                                            // Proxy protocol traffic
+                                            debug_vsock!("[PROXY] Received {} bytes from guest port {}", payload.len(), src_port);
+
+                                            // Extract conn_key from CONNECT packets to map vsock port
+                                            // Proxy packet header: type(1) + conn_key(8) + payload_len(4) = 13 bytes
+                                            if payload.len() >= 13 {
+                                                let pkt_type = payload[0];
+                                                let conn_key = u64::from_le_bytes([
+                                                    payload[1], payload[2], payload[3], payload[4],
+                                                    payload[5], payload[6], payload[7], payload[8],
+                                                ]);
+
+                                                if pkt_type == 0x01 {  // CONNECT
+                                                    debug_vsock!("[PROXY] Mapping conn_key {} -> vsock port {}", conn_key, src_port);
+                                                    proxy_conn_to_vsock_port.insert(conn_key, src_port);
+                                                } else if pkt_type == 0x04 {  // CLOSE
+                                                    debug_vsock!("[PROXY] Removing conn_key {} mapping", conn_key);
+                                                    proxy_conn_to_vsock_port.remove(&conn_key);
+                                                }
+                                            }
+
+                                            let responses = proxy_manager.process_incoming(payload);
+                                            for resp in responses {
+                                                // Send proxy response back to guest
+                                                vsock_transport.device_mut().queue_data_packet(
+                                                    guest_cid,
+                                                    src_port,  // Guest's port
+                                                    OUTBOUND_PROXY_PORT,  // Our port
+                                                    &resp,
+                                                );
+                                            }
+                                        } else {
+                                            // Regular vsock traffic (daemon, etc.)
+                                            debug_vsock!("[VSOCK] RW packet: src_port={} dst_port={} payload_len={}",
+                                                      src_port, dst_port, payload.len());
+                                            vsock_handler.complete_recv(dst_port, src_port, payload.to_vec());
+                                        }
                                     }
                                 }
+                            }
+                        }
+                    }
+
+                    // Poll TCP connections for incoming data
+                    if proxy_manager.has_connections() {
+                        let tcp_data = proxy_manager.poll_tcp();
+                        for (conn_key, data) in tcp_data {
+                            // Look up which vsock peer_port corresponds to this conn_key
+                            if let Some(&peer_port) = proxy_conn_to_vsock_port.get(&conn_key) {
+                                debug_vsock!("[PROXY] Sending {} bytes to guest port {} (conn_key={})", data.len(), peer_port, conn_key);
+                                vsock_transport.device_mut().queue_data_packet(
+                                    guest_cid,
+                                    peer_port,
+                                    OUTBOUND_PROXY_PORT,
+                                    &data,
+                                );
+                            } else {
+                                debug_vsock!("[PROXY] WARNING: No vsock port mapping for conn_key {}, data lost!", conn_key);
                             }
                         }
                     }
@@ -465,6 +554,7 @@ impl VmRuntime {
                     VsockMessage::Connect { guest_port, response } => {
                         let local_port = vsock_handler.next_local_port();
                         if let Err(e) = vsock_transport.device_mut().connect_to_guest(local_port, guest_port) {
+                            eprintln!("[RUNTIME] vsock connect failed: {}", e);
                             let _ = response.send(Err(format!("Connect failed: {}", e)));
                         } else {
                             let _ = response.send(Ok(local_port));
@@ -499,11 +589,11 @@ impl VmRuntime {
                     connection_retries += 1;
                     last_connection_attempt = Some(Instant::now());
 
-                    eprintln!("[RUNTIME] Connecting to daemon (attempt {}/{})", connection_retries, MAX_CONNECTION_RETRIES);
+                    debug_runtime!("[RUNTIME] Connecting to daemon (attempt {}/{})", connection_retries, MAX_CONNECTION_RETRIES);
                     if let Err(e) = vsock_transport.device_mut().connect_to_guest(HOST_PORT, DAEMON_PORT) {
-                        eprintln!("[RUNTIME] Connection attempt failed: {}", e);
+                        debug_runtime!("[RUNTIME] Connection attempt failed: {}", e);
                     } else {
-                        eprintln!("[RUNTIME] Connection request queued, waiting for response...");
+                        debug_runtime!("[RUNTIME] Connection request queued, waiting for response...");
                     }
                 }
             }
@@ -511,7 +601,7 @@ impl VmRuntime {
             // Check if daemon connection succeeded
             if connection_retries > 0 && !daemon_connected {
                 if vsock_transport.device_mut().is_connected_to_guest(HOST_PORT, DAEMON_PORT) {
-                    eprintln!("[RUNTIME] Connected to daemon!");
+                    debug_runtime!("[RUNTIME] Connected to daemon!");
                     daemon_connected = true;
                 }
             }
@@ -528,7 +618,7 @@ impl VmRuntime {
             if let Some(irq) = gic.get_pending_irq() {
                 // Only log non-timer interrupts to reduce spam
                 if irq != crate::device::gic::VTIMER_IRQ {
-                    eprintln!("[RUNTIME] Injecting IRQ {} to guest", irq);
+                    debug_runtime!("[RUNTIME] Injecting IRQ {} to guest", irq);
                 }
                 let vcpu = vm.vcpu_mut(0).ok_or(Error::DeviceError("No vCPU".into()))?;
                 vcpu.set_pending_interrupt(
@@ -600,10 +690,10 @@ impl VmRuntime {
                             }
                         } else {
                             // ISV not set - need to decode instruction to find register
-                            eprintln!("[MMIO] WARNING: ISV not set for write at 0x{:x}, syndrome=0x{:x}", addr, syndrome);
+                            debug_runtime!("[MMIO] WARNING: ISV not set for write at 0x{:x}, syndrome=0x{:x}", addr, syndrome);
                             // Read PC and try to fetch instruction
                             let pc = vcpu.read_register(arm64_reg::HV_REG_PC).unwrap_or(0);
-                            eprintln!("[MMIO] PC=0x{:x}, cannot decode instruction - returning X0", pc);
+                            debug_runtime!("[MMIO] PC=0x{:x}, cannot decode instruction - returning X0", pc);
                             vcpu.read_register(arm64_reg::HV_REG_X0).unwrap_or(0)
                         };
 
@@ -646,7 +736,7 @@ impl VmRuntime {
                                 vsock_transport.device_mut().process_tx(memory)
                             };
 
-                            // Check for data packets to deliver to pending recvs
+                            // Check for data packets to deliver to pending recvs or proxy
                             for pkt in &packets {
                                 if pkt.len() >= 44 {
                                     let op = u16::from_le_bytes([pkt[30], pkt[31]]);
@@ -656,10 +746,44 @@ impl VmRuntime {
                                     if op == 5 { // RW
                                         let payload = &pkt[44..];
                                         if !payload.is_empty() {
-                                            // Use dst_port (host's local port) not HOST_PORT
-                                            eprintln!("[VSOCK] RW packet (notify): src_port={} dst_port={} payload_len={}",
-                                                      src_port, dst_port, payload.len());
-                                            vsock_handler.complete_recv(dst_port, src_port, payload.to_vec());
+                                            // Route based on destination port
+                                            if dst_port == OUTBOUND_PROXY_PORT {
+                                                // Proxy protocol traffic
+                                                debug_vsock!("[PROXY] Received {} bytes from guest port {} (notify)", payload.len(), src_port);
+
+                                                // Extract conn_key from CONNECT packets to map vsock port
+                                                if payload.len() >= 13 {
+                                                    let pkt_type = payload[0];
+                                                    let conn_key = u64::from_le_bytes([
+                                                        payload[1], payload[2], payload[3], payload[4],
+                                                        payload[5], payload[6], payload[7], payload[8],
+                                                    ]);
+
+                                                    if pkt_type == 0x01 {  // CONNECT
+                                                        debug_vsock!("[PROXY] Mapping conn_key {} -> vsock port {} (notify)", conn_key, src_port);
+                                                        proxy_conn_to_vsock_port.insert(conn_key, src_port);
+                                                    } else if pkt_type == 0x04 {  // CLOSE
+                                                        debug_vsock!("[PROXY] Removing conn_key {} mapping (notify)", conn_key);
+                                                        proxy_conn_to_vsock_port.remove(&conn_key);
+                                                    }
+                                                }
+
+                                                let responses = proxy_manager.process_incoming(payload);
+                                                for resp in responses {
+                                                    // Send proxy response back to guest
+                                                    vsock_transport.device_mut().queue_data_packet(
+                                                        guest_cid,
+                                                        src_port,  // Guest's port
+                                                        OUTBOUND_PROXY_PORT,  // Our port
+                                                        &resp,
+                                                    );
+                                                }
+                                            } else {
+                                                // Regular vsock traffic (daemon, etc.)
+                                                debug_vsock!("[VSOCK] RW packet (notify): src_port={} dst_port={} payload_len={}",
+                                                          src_port, dst_port, payload.len());
+                                                vsock_handler.complete_recv(dst_port, src_port, payload.to_vec());
+                                            }
                                         }
                                     }
                                 }
@@ -686,7 +810,7 @@ impl VmRuntime {
                     let func_id = vcpu.read_register(arm64_reg::HV_REG_X0).unwrap_or(0) as u32;
                     let pc = vcpu.read_register(arm64_reg::HV_REG_PC).unwrap_or(0);
 
-                    eprintln!("[RUNTIME] HVC func_id=0x{:08x} at PC=0x{:x}", func_id, pc);
+                    debug_runtime!("[RUNTIME] HVC func_id=0x{:08x} at PC=0x{:x}", func_id, pc);
 
                     match func_id {
                         0x8400_0000 => { // PSCI_VERSION
@@ -711,12 +835,12 @@ impl VmRuntime {
                             vcpu.write_register(arm64_reg::HV_REG_X0, 2)?; // NOT_SUPPORTED - TOS not present
                         }
                         0x8400_0008 | 0xC400_0008 => { // SYSTEM_OFF
-                            eprintln!("[RUNTIME] PSCI SYSTEM_OFF");
+                            debug_runtime!("[RUNTIME] PSCI SYSTEM_OFF");
                             running.store(false, Ordering::Relaxed);
                             vcpu.write_register(arm64_reg::HV_REG_X0, 0)?;
                         }
                         0x8400_0009 | 0xC400_0009 => { // SYSTEM_RESET
-                            eprintln!("[RUNTIME] PSCI SYSTEM_RESET");
+                            debug_runtime!("[RUNTIME] PSCI SYSTEM_RESET");
                             running.store(false, Ordering::Relaxed);
                             vcpu.write_register(arm64_reg::HV_REG_X0, 0)?;
                         }
@@ -731,7 +855,7 @@ impl VmRuntime {
                             vcpu.write_register(arm64_reg::HV_REG_X0, result)?;
                         }
                         _ => {
-                            eprintln!("[RUNTIME] Unknown PSCI func: 0x{:08x}", func_id);
+                            debug_runtime!("[RUNTIME] Unknown PSCI func: 0x{:08x}", func_id);
                             vcpu.write_register(arm64_reg::HV_REG_X0, 0xFFFF_FFFF_FFFF_FFFF)?; // NOT_SUPPORTED
                         }
                     }
@@ -759,19 +883,22 @@ impl VmRuntime {
                     vcpu.write_register(arm64_reg::HV_REG_PC, pc + 4)?;
                 }
                 Ok(VcpuExit::Unknown(reason)) => {
-                    eprintln!("[RUNTIME] Unknown exit: {}", reason);
+                    debug_runtime!("[RUNTIME] Unknown exit: {}", reason);
                 }
                 Ok(_) => {
                     // Other exit types - just continue
                 }
                 Err(e) => {
-                    eprintln!("[RUNTIME] vCPU error: {}", e);
+                    debug_runtime!("[RUNTIME] vCPU error: {}", e);
                     return Err(e);
                 }
             }
         }
 
-        eprintln!("[RUNTIME] VM stopped");
+        // Wait for timer thread to finish
+        let _ = timer_handle.join();
+
+        debug_runtime!("[RUNTIME] VM stopped");
         Ok(())
     }
 

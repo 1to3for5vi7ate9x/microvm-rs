@@ -17,6 +17,7 @@ use microvm::device::virtio::{VirtioBlk, VirtioConsole, VirtioMmioTransport, Vir
 use microvm::backend::hvf::{Vm, VcpuExit};
 
 use microvm::loader::LinuxLoader;
+use microvm::proxy::{ProxyConnectionManager, OUTBOUND_PROXY_PORT};
 
 fn main() {
     if let Err(e) = run() {
@@ -533,10 +534,17 @@ fn run_vm_loop(
     const UART_FBRD: u64 = 0x28;   // Fractional baud rate
     const UART_LCR_H: u64 = 0x2C;  // Line control
     const UART_CR: u64 = 0x30;     // Control register
-    const UART_IMSC: u64 = 0x38;   // Interrupt mask
+    const UART_IMSC: u64 = 0x38;   // Interrupt mask set/clear
+    const UART_RIS: u64 = 0x3C;    // Raw interrupt status
+    const UART_MIS: u64 = 0x40;    // Masked interrupt status
+    const UART_ICR: u64 = 0x44;    // Interrupt clear
 
     // Flag register bits
     const FR_RXFE: u32 = 1 << 4;   // RX FIFO empty
+
+    // Interrupt bits (for RIS, MIS, IMSC, ICR)
+    const INT_RXIS: u32 = 1 << 4;  // Receive interrupt
+    const INT_TXIS: u32 = 1 << 5;  // Transmit interrupt
 
     // GIC Distributor registers
     const GICD_CTLR: u64 = 0x000;    // Control register
@@ -557,8 +565,16 @@ fn run_vm_loop(
     // Pending interrupt tracking
     let mut virtio_irq_pending: bool = false;  // Track pending VirtIO interrupt
     let mut timer_irq_pending: bool = false;   // Track pending timer interrupt
+    let mut uart_irq_pending: bool = false;    // Track pending UART RX interrupt
     const VIRTIO_IRQ: u32 = 32 + 16;  // SPI 16 = IRQ 48
     const VTIMER_IRQ: u32 = 16 + 11;  // PPI 11 = IRQ 27 (virtual timer)
+    const UART_IRQ: u32 = 32 + 1;     // SPI 1 = IRQ 33 (PL011 UART)
+
+    // UART RX buffer for stdin input (when not using VirtIO console)
+    let mut uart_rx_buffer: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
+    // UART interrupt mask (IMSC) - controls which interrupts are enabled
+    // The kernel will set this to enable RX interrupts
+    let mut uart_imsc: u32 = 0;
 
     // Create VirtIO console transport if enabled
     let mut virtio_console = if enable_console {
@@ -594,8 +610,12 @@ fn run_vm_loop(
     const VSOCK_ECHO_PORT: u32 = 1234;  // Echo server port for testing
     let mut vsock_device = VirtioVsock::new(GUEST_CID);
     vsock_device.listen(VSOCK_ECHO_PORT);  // Enable echo server on port 1234
+    vsock_device.listen(OUTBOUND_PROXY_PORT);  // Enable outbound proxy on port 7601
     let mut virtio_vsock = Some(VirtioMmioTransport::new(vsock_device, VIRTIO_VSOCK_BASE));
-    println!("Vsock: CID {} at 0x{:x} (echo server on port {})", GUEST_CID, VIRTIO_VSOCK_BASE, VSOCK_ECHO_PORT);
+    println!("Vsock: CID {} at 0x{:x} (echo:{}, proxy:{})", GUEST_CID, VIRTIO_VSOCK_BASE, VSOCK_ECHO_PORT, OUTBOUND_PROXY_PORT);
+
+    // Create proxy connection manager for outbound internet access
+    let mut proxy_manager = ProxyConnectionManager::new();
 
     // Create VirtIO network device if enabled
     // Note: vmnet backend is disabled due to entitlement issues with ad-hoc signing.
@@ -609,12 +629,9 @@ fn run_vm_loop(
         None
     };
 
-    // Set up non-blocking stdin for console input
-    let stdin_enabled = if enable_console {
-        setup_raw_terminal()?
-    } else {
-        false
-    };
+    // Set up non-blocking stdin for console input (UART or VirtIO console)
+    // Always enable stdin for interactive use
+    let stdin_enabled = setup_raw_terminal()?;
 
     // Cleanup guard for terminal settings
     struct TerminalGuard;
@@ -630,11 +647,23 @@ fn run_vm_loop(
     };
 
     loop {
-        // Check for stdin input if console is enabled
+        // Check for stdin input
         if stdin_enabled {
             if let Some(input) = read_stdin_nonblocking() {
                 if let Some(ref mut transport) = virtio_console {
+                    // VirtIO console mode: send to hvc0
                     transport.device_mut().queue_input(&input);
+                } else {
+                    // UART mode: send to PL011 (ttyAMA0)
+                    for byte in input {
+                        if uart_rx_buffer.len() < 16 {
+                            uart_rx_buffer.push_back(byte);
+                        }
+                    }
+                    // Signal UART RX interrupt
+                    if !uart_rx_buffer.is_empty() {
+                        uart_irq_pending = true;
+                    }
                 }
             }
         }
@@ -656,9 +685,99 @@ fn run_vm_loop(
             }
         }
 
+        // Poll TCP connections for incoming data (outbound proxy)
+        if proxy_manager.has_connections() {
+            let tcp_data = proxy_manager.poll_tcp();
+            for (_conn_key, data) in tcp_data {
+                if let Some(ref mut transport) = virtio_vsock {
+                    // Find the guest's port that connected to us on 7601
+                    let target_conn = transport.device_mut().connections()
+                        .find(|(key, _)| key.local_port == OUTBOUND_PROXY_PORT)
+                        .map(|(_, conn)| (conn.peer_cid, conn.peer_port));
+
+                    if let Some((_peer_cid, peer_port)) = target_conn {
+                        eprintln!("[PROXY] Sending {} bytes to guest port {}", data.len(), peer_port);
+                        transport.device_mut().queue_data_packet(
+                            GUEST_CID,
+                            peer_port,
+                            OUTBOUND_PROXY_PORT,
+                            &data,
+                        );
+
+                        // Deliver the data immediately
+                        let memory = vm.memory_mut().as_mut_slice();
+                        if transport.device_mut().process_rx(memory) {
+                            transport.signal_interrupt();
+                            vsock_irq_pending = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // PROACTIVE: Poll vsock TX queue to catch packets without QUEUE_NOTIFY
+        // This handles cases where the kernel queues packets but doesn't notify immediately
+        if let Some(ref mut transport) = virtio_vsock {
+            // Only poll if TX queue is ready
+            if transport.device().tx_queue_ready() {
+                // Sync queue configs
+                if let Some(queue) = transport.queue(1).cloned() {
+                    transport.device_mut().sync_tx_queue(&queue);
+                }
+
+                // Try to process TX queue
+                let memory = vm.memory_mut().as_mut_slice();
+                let packets = transport.device_mut().process_tx(memory);
+                if !packets.is_empty() {
+                    eprintln!("[VSOCK-POLL] Proactive TX poll found {} packets!", packets.len());
+                    transport.signal_interrupt();
+                    vsock_irq_pending = true;
+
+                    // Process packets - route to proxy or echo based on port
+                    for pkt in &packets {
+                        if pkt.len() >= 44 {
+                            let op = u16::from_le_bytes([pkt[30], pkt[31]]);
+                            let src_port = u32::from_le_bytes([pkt[16], pkt[17], pkt[18], pkt[19]]);
+                            let dst_port = u32::from_le_bytes([pkt[20], pkt[21], pkt[22], pkt[23]]);
+
+                            eprintln!("[VSOCK-POLL] Packet: op={} src_port={} dst_port={}", op, src_port, dst_port);
+
+                            if op == 5 { // RW (data packet)
+                                let payload = &pkt[44..];
+                                if !payload.is_empty() && dst_port == OUTBOUND_PROXY_PORT {
+                                    eprintln!("[PROXY-POLL] Received {} bytes from guest port {}", payload.len(), src_port);
+                                    let responses = proxy_manager.process_incoming(payload);
+                                    for resp in responses {
+                                        transport.device_mut().queue_data_packet(
+                                            GUEST_CID,
+                                            src_port,
+                                            OUTBOUND_PROXY_PORT,
+                                            &resp,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Process echo server for non-proxy ports
+                    transport.device_mut().process_echo();
+
+                    // Deliver any pending RX packets
+                    if transport.device().has_rx_data() {
+                        let memory = vm.memory_mut().as_mut_slice();
+                        if transport.device_mut().process_rx(memory) {
+                            transport.signal_interrupt();
+                            vsock_irq_pending = true;
+                        }
+                    }
+                }
+            }
+        }
+
         // Inject IRQ to wake guest if we have any pending interrupt
         // This covers both pre-loop processing (need_irq) and interrupts set during MMIO handling
-        if need_irq || timer_irq_pending || virtio_irq_pending || blk_irq_pending || vsock_irq_pending || net_irq_pending {
+        if need_irq || timer_irq_pending || virtio_irq_pending || blk_irq_pending || vsock_irq_pending || net_irq_pending || uart_irq_pending {
             if let Some(vcpu) = vm.vcpu_mut(0) {
                 use microvm::backend::hvf::bindings::arm64_interrupt::HV_INTERRUPT_TYPE_IRQ;
                 let _ = vcpu.set_pending_interrupt(HV_INTERRUPT_TYPE_IRQ, true);
@@ -769,6 +888,7 @@ fn run_vm_loop(
                         // Handle queue notify
                         if offset == mmio::QUEUE_NOTIFY as u64 {
                             let notified_queue = value;
+                            eprintln!("[VSOCK-CLI] QUEUE_NOTIFY for queue {}", notified_queue);
 
                             // Clone queue configs first to avoid borrow conflict
                             let rx_queue_config = transport.queue(0).cloned();
@@ -799,13 +919,42 @@ fn run_vm_loop(
 
                             // Process TX queue (queue 1) - receive packets from guest
                             if notified_queue == 1 {
+                                eprintln!("[VSOCK-CLI] Processing TX queue");
                                 let memory = vm.memory_mut().as_mut_slice();
                                 let packets = transport.device_mut().process_tx(memory);
+                                eprintln!("[VSOCK-CLI] TX processed, {} packets", packets.len());
                                 if !packets.is_empty() {
                                     transport.signal_interrupt();
                                     vsock_irq_pending = true;
 
-                                    // Process echo server - echo received data back to guest
+                                    // Process packets - route to proxy or echo based on port
+                                    for pkt in &packets {
+                                        if pkt.len() >= 44 {
+                                            let op = u16::from_le_bytes([pkt[30], pkt[31]]);
+                                            let src_port = u32::from_le_bytes([pkt[16], pkt[17], pkt[18], pkt[19]]);
+                                            let dst_port = u32::from_le_bytes([pkt[20], pkt[21], pkt[22], pkt[23]]);
+
+                                            if op == 5 { // RW (data packet)
+                                                let payload = &pkt[44..];
+                                                if !payload.is_empty() && dst_port == OUTBOUND_PROXY_PORT {
+                                                    // Proxy protocol traffic
+                                                    eprintln!("[PROXY] Received {} bytes from guest port {}", payload.len(), src_port);
+                                                    let responses = proxy_manager.process_incoming(payload);
+                                                    for resp in responses {
+                                                        // Send response back to guest
+                                                        transport.device_mut().queue_data_packet(
+                                                            GUEST_CID,
+                                                            src_port,
+                                                            OUTBOUND_PROXY_PORT,
+                                                            &resp,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Process echo server for non-proxy ports
                                     transport.device_mut().process_echo();
                                 }
 
@@ -861,8 +1010,19 @@ fn run_vm_loop(
                             let _ = std::io::stdout().write_all(&[ch]);
                             let _ = std::io::stdout().flush();
                         }
-                        UART_IBRD | UART_FBRD | UART_LCR_H | UART_CR | UART_IMSC => {
+                        UART_IBRD | UART_FBRD | UART_LCR_H | UART_CR => {
                             // Ignore configuration writes for now
+                        }
+                        UART_IMSC => {
+                            // Store interrupt mask - kernel enables RX interrupts here
+                            uart_imsc = value & 0x7FF;
+                        }
+                        UART_ICR => {
+                            // Interrupt clear register - clear pending interrupts
+                            // Clear uart_irq_pending if RXIS is being cleared
+                            if (value & INT_RXIS) != 0 && uart_rx_buffer.is_empty() {
+                                uart_irq_pending = false;
+                            }
                         }
                         _ => {}
                     }
@@ -945,12 +1105,59 @@ fn run_vm_loop(
                         0
                     }
                 }
-                // Handle PL011 UART reads (for earlycon)
+                // Handle PL011 UART reads
                 else if addr >= UART_BASE && addr < UART_BASE + 0x1000 {
                     let offset = addr - UART_BASE;
                     match offset {
-                        UART_DR => 0, // No input from PL011 when using VirtIO
-                        UART_FR => FR_RXFE as u64, // RX FIFO always empty
+                        UART_DR => {
+                            // Read from UART RX buffer
+                            if let Some(byte) = uart_rx_buffer.pop_front() {
+                                // Clear interrupt when buffer is empty
+                                if uart_rx_buffer.is_empty() {
+                                    uart_irq_pending = false;
+                                }
+                                byte as u64
+                            } else {
+                                0
+                            }
+                        }
+                        UART_FR => {
+                            // Flag register: RXFE=1 if RX FIFO is empty, TXFE=1 (TX always ready)
+                            let mut flags = 1 << 7; // TXFE - TX FIFO empty (always ready)
+                            if uart_rx_buffer.is_empty() {
+                                flags |= FR_RXFE; // RX FIFO empty
+                            }
+                            flags as u64
+                        }
+                        UART_IMSC => {
+                            // Interrupt mask register
+                            uart_imsc as u64
+                        }
+                        UART_RIS => {
+                            // Raw interrupt status - RXIS set when data available
+                            let mut ris = INT_TXIS; // TX interrupt always set (TX always ready)
+                            if !uart_rx_buffer.is_empty() {
+                                ris |= INT_RXIS;
+                            }
+                            ris as u64
+                        }
+                        UART_MIS => {
+                            // Masked interrupt status = RIS & IMSC
+                            let mut ris = INT_TXIS;
+                            if !uart_rx_buffer.is_empty() {
+                                ris |= INT_RXIS;
+                            }
+                            (ris & uart_imsc) as u64
+                        }
+                        // PrimeCell ID registers (needed for AMBA driver)
+                        0xFE0 => 0x11, // PID0
+                        0xFE4 => 0x10, // PID1
+                        0xFE8 => 0x14, // PID2
+                        0xFEC => 0x00, // PID3
+                        0xFF0 => 0x0D, // CID0
+                        0xFF4 => 0xF0, // CID1
+                        0xFF8 => 0x05, // CID2
+                        0xFFC => 0xB1, // CID3
                         _ => 0,
                     }
                 }
@@ -981,10 +1188,13 @@ fn run_vm_loop(
                         GICC_PMR => gic_pmr as u64,
                         GICC_IAR => {
                             // Return highest priority pending interrupt
-                            // Priority: timer > console > block > vsock
+                            // Priority: timer > uart > console > block > vsock > net
                             let irq = if timer_irq_pending {
                                 timer_irq_pending = false;  // Clear on acknowledge
                                 VTIMER_IRQ
+                            } else if uart_irq_pending {
+                                uart_irq_pending = false;  // Clear on acknowledge
+                                UART_IRQ
                             } else if virtio_irq_pending {
                                 virtio_irq_pending = false;  // Clear on acknowledge
                                 VIRTIO_IRQ
@@ -1002,7 +1212,7 @@ fn run_vm_loop(
                             };
 
                             // If there are still pending interrupts, keep IRQ asserted
-                            if timer_irq_pending || virtio_irq_pending || blk_irq_pending || vsock_irq_pending || net_irq_pending {
+                            if timer_irq_pending || uart_irq_pending || virtio_irq_pending || blk_irq_pending || vsock_irq_pending || net_irq_pending {
                                 reassert_irq = true;
                             }
 
@@ -1089,7 +1299,7 @@ fn run_vm_loop(
             }
             VcpuExit::Wfi => {
                 // Only sleep if no interrupts pending - otherwise wake immediately
-                if !timer_irq_pending && !virtio_irq_pending && !blk_irq_pending && !vsock_irq_pending && !net_irq_pending {
+                if !timer_irq_pending && !uart_irq_pending && !virtio_irq_pending && !blk_irq_pending && !vsock_irq_pending && !net_irq_pending {
                     std::thread::sleep(std::time::Duration::from_micros(100));
                 }
             }
