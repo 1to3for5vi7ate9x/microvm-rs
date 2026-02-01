@@ -8,7 +8,19 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::error::{Error, Result};
+
+// Platform-specific VcpuExit imports
+#[cfg(target_os = "macos")]
 use crate::backend::hvf::VcpuExit;
+#[cfg(target_os = "windows")]
+use crate::backend::whp::VcpuExit;
+
+// Provide a stub type for unsupported platforms
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[derive(Debug, Clone)]
+pub enum VcpuExit {
+    Unknown(u32),
+}
 
 /// Exit handler callback type.
 /// Returns true to continue running, false to stop.

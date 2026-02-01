@@ -8,13 +8,21 @@ use std::process;
 
 use microvm::backend::VmConfig;
 
-#[cfg(target_arch = "aarch64")]
+// macOS ARM64 (Apple Silicon)
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use microvm::backend::hvf::{bindings::arm64_reg, Vm, VcpuExit};
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use microvm::device::virtio::{VirtioBlk, VirtioConsole, VirtioMmioTransport, VirtioVsock, VirtioNet, NullBackend};
 
-#[cfg(target_arch = "x86_64")]
+// macOS x86_64 (Intel)
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 use microvm::backend::hvf::{Vm, VcpuExit};
+
+// Windows
+#[cfg(target_os = "windows")]
+use microvm::backend::whp::{Vm, VcpuExit};
+#[cfg(target_os = "windows")]
+use windows::Win32::System::Hypervisor::*;
 
 use microvm::loader::LinuxLoader;
 use microvm::proxy::{ProxyConnectionManager, OUTBOUND_PROXY_PORT};
@@ -231,7 +239,8 @@ fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     // Load kernel
-    let mut loader = LinuxLoader::new(&kernel_path)?;
+    let mut loader = LinuxLoader::new(&kernel_path)?
+        .with_memory_mb(memory_mb);
 
     if let Some(ref initrd) = initrd_path {
         loader = loader.with_initrd(initrd)?;
@@ -316,6 +325,27 @@ fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         vcpu.write_register(arm64_reg::HV_REG_X1, 0)?;
         vcpu.write_register(arm64_reg::HV_REG_X2, 0)?;
         vcpu.write_register(arm64_reg::HV_REG_X3, 0)?;
+    }
+
+    // x86_64 vCPU setup (Windows WHP or macOS Intel)
+    #[cfg(target_arch = "x86_64")]
+    {
+        if let (Some(start), Some(end)) = (kernel_info.initrd_start, kernel_info.initrd_end) {
+            println!("  Initrd: 0x{:x} - 0x{:x} ({} bytes)", start, end, end - start);
+        }
+
+        // Set up page tables for 64-bit long mode
+        // We create identity-mapped page tables at physical address 0x1000
+        setup_page_tables(vm.memory_mut().as_mut_slice())?;
+
+        // Set up GDT at 0x500
+        setup_gdt(vm.memory_mut().as_mut_slice())?;
+
+        // Initialize vCPU for long mode
+        const BOOT_PARAMS_ADDR: u64 = 0x10000;
+        let vcpu = vm.vcpu_mut(0).ok_or("No vCPU available")?;
+        vcpu.init_long_mode(kernel_info.entry, BOOT_PARAMS_ADDR)?;
+        println!("  vCPU initialized for 64-bit long mode");
     }
 
     println!("\nBooting VM...");
@@ -504,7 +534,7 @@ fn handle_psci_call(function_id: u64) -> u64 {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run_vm_loop(
     vm: &mut Vm,
     enable_console: bool,
@@ -1351,10 +1381,12 @@ fn run_vm_loop(
     Ok(())
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 fn run_vm_loop(
     vm: &mut Vm,
     _enable_console: bool,
+    _enable_net: bool,
+    _disk_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
 
@@ -1369,12 +1401,15 @@ fn run_vm_loop(
                     std::io::stdout().flush().ok();
                 }
             }
-            VcpuExit::IoIn { port, size } => {
+            VcpuExit::IoIn { port, size: _ } => {
                 // Handle serial input
-                use microvm::backend::hvf::bindings::x86_reg;
-                if port == 0x3fd {
-                    // Line status register - transmitter empty
-                    vcpu.write_register(x86_reg::HV_X86_RAX, 0x20)?;
+                #[cfg(target_os = "macos")]
+                {
+                    use microvm::backend::hvf::bindings::x86_reg;
+                    if port == 0x3fd {
+                        // Line status register - transmitter empty
+                        vcpu.write_register(x86_reg::HV_X86_RAX, 0x20)?;
+                    }
                 }
             }
             VcpuExit::Hlt => {
@@ -1389,6 +1424,513 @@ fn run_vm_loop(
             }
         }
     }
+
+    Ok(())
+}
+
+// Windows WHP backend
+#[cfg(target_os = "windows")]
+fn run_vm_loop(
+    vm: &mut Vm,
+    _enable_console: bool,
+    _enable_net: bool,
+    _disk_path: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+
+    // Serial port constants (8250 UART)
+    const COM1_DATA: u16 = 0x3f8;        // Data register
+    const COM1_IER: u16 = 0x3f9;         // Interrupt Enable Register
+    const COM1_FCR: u16 = 0x3fa;         // FIFO Control Register / IIR
+    const COM1_LCR: u16 = 0x3fb;         // Line Control Register
+    const COM1_MCR: u16 = 0x3fc;         // Modem Control Register
+    const COM1_LSR: u16 = 0x3fd;         // Line Status Register
+    const COM1_MSR: u16 = 0x3fe;         // Modem Status Register
+
+    // PIT (Programmable Interval Timer) ports
+    const PIT_CH0: u16 = 0x40;           // Channel 0 counter
+    const PIT_CH1: u16 = 0x41;           // Channel 1 counter
+    const PIT_CH2: u16 = 0x42;           // Channel 2 counter (PC speaker)
+    const PIT_CMD: u16 = 0x43;           // Command register
+
+    // PCI Configuration ports
+    const PCI_CONFIG_ADDR: u16 = 0xCF8;  // PCI config address
+    const PCI_CONFIG_DATA: u16 = 0xCFC;  // PCI config data (also 0xCFD, 0xCFE, 0xCFF)
+
+    // Simple PIT state for timer calibration
+    // The kernel reads the counter repeatedly to measure time
+    let mut pit_counter: u16 = 0xFFFF;
+
+    println!("Starting WHP VM execution...");
+    let mut exit_count = 0;
+    let verbose_debug = false; // Disable verbose debugging for now
+
+    loop {
+        // Run vcpu and get exit reason
+        let exit = {
+            let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
+            vcpu.run()?
+        };
+        exit_count += 1;
+
+        // Verbose debug for first 30 exits only
+        if verbose_debug && exit_count <= 30 {
+            eprintln!("[Exit {}] {:?}", exit_count, exit);
+        }
+
+        // Print periodic status every 1000 exits
+        if exit_count % 1000 == 0 {
+            let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
+            if let Ok(rip) = vcpu.read_register(WHvX64RegisterRip) {
+                eprintln!("[Status] {} exits, RIP=0x{:x}", exit_count, rip);
+            }
+        }
+
+        // Handle MSR exits specially
+        // NOTE: WHP has a known bug where it doesn't report the MSR number being accessed.
+        // We can't reliably determine which MSR is being accessed, so we:
+        // - Return 0 for all MSR reads
+        // - Ignore all MSR writes
+        // This follows QEMU's WHPX approach and allows the kernel to make progress.
+        match &exit {
+            VcpuExit::MsrRead { msr } if *msr == 0 => {
+                // WHP bug: MSR number is 0 - just return 0 and advance
+                static MSR_READ_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let count = MSR_READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if count < 3 {
+                    let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
+                    let rip = vcpu.read_register(WHvX64RegisterRip).unwrap_or(0);
+                    eprintln!("[MSR READ] RIP=0x{:x} (MSR unknown due to WHP bug, returning 0)", rip);
+                }
+
+                let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
+                vcpu.set_msr_result(0)?;
+                vcpu.advance_rip(2)?;
+                continue;
+            }
+            VcpuExit::MsrWrite { msr, value } if *msr == 0 => {
+                // WHP bug: MSR number is 0 - just ignore the write and advance
+                static MSR_WRITE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let count = MSR_WRITE_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if count < 3 {
+                    let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
+                    let rip = vcpu.read_register(WHvX64RegisterRip).unwrap_or(0);
+                    eprintln!("[MSR WRITE] RIP=0x{:x}, value=0x{:x} (MSR unknown, ignoring)", rip, value);
+                }
+
+                let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
+                vcpu.advance_rip(2)?;
+                continue;
+            }
+            _ => {}
+        }
+
+        // Get vcpu for main match handling
+        let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
+
+        match exit {
+            VcpuExit::IoOut { port, data, instruction_len } => {
+                match port {
+                    COM1_DATA => {
+                        // Serial output
+                        if !data.is_empty() {
+                            print!("{}", data[0] as char);
+                            std::io::stdout().flush().ok();
+                        }
+                    }
+                    COM1_IER | COM1_FCR | COM1_LCR | COM1_MCR => {
+                        // Ignore configuration writes for now
+                    }
+                    0x80 => {
+                        // Debug port - commonly used for POST codes
+                    }
+                    PIT_CMD => {
+                        // PIT command - just ignore, we don't fully emulate the PIT
+                    }
+                    PIT_CH0 | PIT_CH1 | PIT_CH2 => {
+                        // PIT counter write - reset counter or set reload value
+                        pit_counter = 0xFFFF;
+                    }
+                    PCI_CONFIG_ADDR => {
+                        // PCI config address write - ignore for now
+                    }
+                    PCI_CONFIG_DATA..=0xCFF => {
+                        // PCI config data write - ignore
+                    }
+                    _ => {
+                        // Unknown I/O port write
+                    }
+                }
+                // Advance RIP past the OUT instruction
+                vcpu.advance_rip(instruction_len as u64)?;
+            }
+            VcpuExit::IoIn { port, size, instruction_len } => {
+                match port {
+                    COM1_LSR => {
+                        // Line Status Register
+                        // Bit 5: Transmitter Holding Register Empty
+                        // Bit 6: Transmitter Empty
+                        vcpu.set_rax(0x60)?; // THR empty, transmitter empty
+                    }
+                    COM1_DATA => {
+                        // No input available
+                        vcpu.set_rax(0)?;
+                    }
+                    COM1_IER | COM1_FCR | COM1_LCR | COM1_MCR | COM1_MSR => {
+                        // Return 0 for other registers
+                        vcpu.set_rax(0)?;
+                    }
+                    PIT_CH0 | PIT_CH1 | PIT_CH2 => {
+                        // PIT counter read - return decreasing value for timer calibration
+                        // Decrement counter by a reasonable amount to simulate time passing
+                        pit_counter = pit_counter.wrapping_sub(100);
+                        if size == 1 {
+                            // 8-bit read (depends on latch state, simplified)
+                            vcpu.set_rax((pit_counter & 0xFF) as u64)?;
+                        } else {
+                            // 16-bit read
+                            vcpu.set_rax(pit_counter as u64)?;
+                        }
+                    }
+                    PCI_CONFIG_ADDR => {
+                        // Return 0 for PCI config address read
+                        vcpu.set_rax(0)?;
+                    }
+                    PCI_CONFIG_DATA..=0xCFF => {
+                        // PCI config data read - return 0xFFFFFFFF (no device)
+                        vcpu.set_rax(0xFFFFFFFF)?;
+                    }
+                    _ => {
+                        // Unknown I/O port read - return 0xFF (all bits set)
+                        vcpu.set_rax(0xFF)?;
+                    }
+                }
+                // Advance RIP past the IN instruction
+                vcpu.advance_rip(instruction_len as u64)?;
+            }
+            VcpuExit::Cpuid { rax, rcx } => {
+                // Handle CPUID instruction
+                let (eax, ebx, ecx, edx) = handle_cpuid(rax as u32, rcx as u32);
+                vcpu.set_cpuid_result(eax, ebx, ecx, edx)?;
+                vcpu.advance_rip(2)?; // CPUID is 2 bytes (0x0F 0xA2)
+            }
+            VcpuExit::MmioRead { addr, size: _ } => {
+                eprintln!("MMIO read at 0x{:x}", addr);
+            }
+            VcpuExit::MmioWrite { addr, data: _ } => {
+                eprintln!("MMIO write at 0x{:x}", addr);
+            }
+            VcpuExit::Hlt => {
+                println!("\nVM halted (HLT instruction)");
+                break;
+            }
+            VcpuExit::Shutdown => {
+                println!("\nVM shutdown");
+                break;
+            }
+            VcpuExit::Canceled => {
+                println!("\nVM execution canceled");
+                break;
+            }
+            VcpuExit::MsrRead { msr } => {
+                // msr==0 case is handled above before the main match
+                // This handles the case where WHP properly reported the MSR number
+                let value = handle_msr_read(msr);
+                vcpu.set_msr_result(value)?;
+                vcpu.advance_rip(2)?; // RDMSR is 2 bytes (0x0F 0x32)
+            }
+            VcpuExit::MsrWrite { msr, value } => {
+                // msr==0 case is handled above before the main match
+                // This handles the case where WHP properly reported the MSR number
+                handle_msr_write(msr, value);
+                vcpu.advance_rip(2)?; // WRMSR is 2 bytes (0x0F 0x30)
+            }
+            VcpuExit::Rdtsc => {
+                // Return an increasing TSC value to simulate time passing
+                static TSC_VALUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let tsc = TSC_VALUE.fetch_add(1_000_000, std::sync::atomic::Ordering::SeqCst);
+                // RDTSC returns result in EDX:EAX
+                vcpu.write_register(WHvX64RegisterRax, tsc & 0xFFFFFFFF)?;
+                vcpu.write_register(WHvX64RegisterRdx, tsc >> 32)?;
+                vcpu.advance_rip(2)?; // RDTSC is 2 bytes (0x0F 0x31)
+            }
+            VcpuExit::Exception { exception_type, error_code, rip } => {
+                // x86 exception types:
+                // 0=DE (Divide Error), 6=UD (Invalid Opcode), 8=DF (Double Fault)
+                // 13=GP (General Protection), 14=PF (Page Fault)
+                let exception_name = match exception_type {
+                    0 => "Divide Error (#DE)",
+                    1 => "Debug (#DB)",
+                    3 => "Breakpoint (#BP)",
+                    4 => "Overflow (#OF)",
+                    5 => "BOUND Range Exceeded (#BR)",
+                    6 => "Invalid Opcode (#UD)",
+                    7 => "Device Not Available (#NM)",
+                    8 => "Double Fault (#DF)",
+                    10 => "Invalid TSS (#TS)",
+                    11 => "Segment Not Present (#NP)",
+                    12 => "Stack-Segment Fault (#SS)",
+                    13 => "General Protection (#GP)",
+                    14 => "Page Fault (#PF)",
+                    16 => "x87 FPU Error (#MF)",
+                    17 => "Alignment Check (#AC)",
+                    18 => "Machine Check (#MC)",
+                    19 => "SIMD Exception (#XM)",
+                    _ => "Unknown Exception",
+                };
+                eprintln!("\nException: {} (type={}, error_code=0x{:x})", exception_name, exception_type, error_code);
+                eprintln!("  RIP at fault: 0x{:016x}", rip);
+                // Dump additional CPU state
+                if let Ok(rsp) = vcpu.read_register(WHvX64RegisterRsp) {
+                    eprintln!("  RSP: 0x{:016x}", rsp);
+                }
+                if let Ok(cr2) = vcpu.read_register(WHvX64RegisterCr2) {
+                    eprintln!("  CR2 (page fault addr): 0x{:016x}", cr2);
+                }
+                break;
+            }
+            VcpuExit::InterceptedException { exception_type, error_code, rip, parameter } => {
+                // Intercepted exception (from exception bitmap)
+                let exception_name = match exception_type {
+                    0 => "Divide Error (#DE)",
+                    13 => "General Protection (#GP)",
+                    14 => "Page Fault (#PF)",
+                    _ => "Other",
+                };
+                // For #GP, we need to decide whether to re-inject or handle
+                if exception_type == 13 {
+                    // #GP - this might be from an invalid MSR access
+                    // Print debug info but continue execution
+                    eprintln!("[Intercepted #GP] error_code=0x{:x}, RIP=0x{:x}, param=0x{:x}",
+                        error_code, rip, parameter);
+                    // Re-inject the exception to the guest so it can handle it
+                    // For now, just print and break to understand what's happening
+                    eprintln!("  (Breaking to analyze - #GP at guest RIP 0x{:x})", rip);
+                    break;
+                } else {
+                    eprintln!("Intercepted exception: {} (type={}, error=0x{:x}) at RIP=0x{:x}",
+                        exception_name, exception_type, error_code, rip);
+                    break;
+                }
+            }
+            VcpuExit::Unknown(reason) => {
+                eprintln!("Unknown exit reason: {}", reason);
+                // Debug: dump CPU state
+                if let Ok(rip) = vcpu.read_register(WHvX64RegisterRip) {
+                    eprintln!("  RIP: 0x{:016x}", rip);
+                }
+                if let Ok(rsp) = vcpu.read_register(WHvX64RegisterRsp) {
+                    eprintln!("  RSP: 0x{:016x}", rsp);
+                }
+                if let Ok(cr0) = vcpu.read_register(WHvX64RegisterCr0) {
+                    eprintln!("  CR0: 0x{:016x}", cr0);
+                }
+                if let Ok(cr3) = vcpu.read_register(WHvX64RegisterCr3) {
+                    eprintln!("  CR3: 0x{:016x}", cr3);
+                }
+                if let Ok(cr4) = vcpu.read_register(WHvX64RegisterCr4) {
+                    eprintln!("  CR4: 0x{:016x}", cr4);
+                }
+                if let Ok(efer) = vcpu.read_register(WHvX64RegisterEfer) {
+                    eprintln!("  EFER: 0x{:016x}", efer);
+                }
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle MSR read for WHP.
+#[cfg(target_os = "windows")]
+fn handle_msr_read(msr: u32) -> u64 {
+    // Use a static counter to simulate time passing for MSR 0 reads
+    // The kernel might be in a delay loop polling an MSR
+    static MSR0_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    match msr {
+        // IA32_P5_MC_ADDR / probing MSR - or unknown MSR being probed
+        // Return an increasing value to simulate time passing
+        0x0 => {
+            MSR0_COUNTER.fetch_add(0x100000, std::sync::atomic::Ordering::SeqCst)
+        }
+        // IA32_APIC_BASE
+        0x1B => 0xFEE00900,
+        // IA32_MTRRCAP
+        0xFE => 0x0000000000000508,
+        // IA32_MISC_ENABLE
+        0x1A0 => 0x00000001,
+        // IA32_EFER (already set by init_long_mode, but reading is fine)
+        0xC0000080 => 0x500,
+        // IA32_FS_BASE
+        0xC0000100 => 0,
+        // IA32_GS_BASE
+        0xC0000101 => 0,
+        // IA32_KERNEL_GS_BASE
+        0xC0000102 => 0,
+        // IA32_TSC_AUX
+        0xC0000103 => 0,
+        // IA32_STAR - for syscall/sysret
+        0xC0000081 => 0,
+        // IA32_LSTAR - syscall entry point
+        0xC0000082 => 0,
+        // IA32_CSTAR - compat mode syscall entry
+        0xC0000083 => 0,
+        // IA32_FMASK - syscall flags mask
+        0xC0000084 => 0,
+        // Return 0 for unknown MSRs (silently, don't flood logs)
+        _ => 0,
+    }
+}
+
+/// Handle MSR write for WHP.
+#[cfg(target_os = "windows")]
+fn handle_msr_write(msr: u32, _value: u64) {
+    // Silently ignore all MSR writes for now
+    // The kernel will write to various MSRs during boot
+    match msr {
+        0x0 | 0xC0000080 | 0xC0000100 | 0xC0000101 | 0xC0000102 => {}
+        0xC0000081 | 0xC0000082 | 0xC0000083 | 0xC0000084 | 0x1B => {}
+        _ => {}
+    }
+}
+
+/// Handle CPUID instruction for WHP.
+#[cfg(target_os = "windows")]
+fn handle_cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
+    match leaf {
+        0 => {
+            // Vendor ID: "GenuineIntel"
+            // EAX = max standard leaf (we support up to 0xD)
+            // EBX:EDX:ECX = "GenuineIntel"
+            (0xD, 0x756E6547, 0x6C65746E, 0x49656E69) // "Genu" "ineI" "ntel"
+        }
+        1 => {
+            // Processor info and features
+            let eax = 0x000506E3; // Family 6, Model 94 (Skylake-like)
+            let ebx = 0x00100800; // CLFLUSH=8, APIC ID=0, 1 logical processor
+            // ECX features: SSE3, PCLMULQDQ, SSSE3, SSE4.1, SSE4.2, POPCNT, AES, XSAVE, OSXSAVE, AVX
+            let ecx = 0x00000201; // SSE3, minimal features
+            // EDX features: FPU, VME, DE, PSE, TSC, MSR, PAE, MCE, CX8, APIC, SEP, MTRR, PGE, MCA, CMOV, PAT, PSE36, CLFSH, MMX, FXSR, SSE, SSE2
+            let edx = 0x178BFBFF;
+            (eax, ebx, ecx, edx)
+        }
+        2 => {
+            // Cache and TLB info (return null descriptors)
+            (0x00000001, 0, 0, 0)
+        }
+        4 => {
+            // Deterministic cache parameters
+            (0, 0, 0, 0) // No cache info
+        }
+        6 => {
+            // Thermal and power management
+            (0, 0, 0, 0)
+        }
+        7 => {
+            // Structured extended feature flags
+            if subleaf == 0 {
+                (0, 0, 0, 0) // No advanced features
+            } else {
+                (0, 0, 0, 0)
+            }
+        }
+        0xB => {
+            // Extended topology enumeration
+            (0, 0, 0, 0)
+        }
+        0xD => {
+            // Processor extended state enumeration
+            (0, 0, 0, 0)
+        }
+        0x80000000 => {
+            // Extended function info - max extended leaf
+            (0x80000008, 0, 0, 0)
+        }
+        0x80000001 => {
+            // Extended processor features
+            // EDX bit 29 = LM (long mode), bit 20 = NX
+            (0, 0, 0x00000001, 0x2C100800) // LAHF, NX, LM, SYSCALL
+        }
+        0x80000002..=0x80000004 => {
+            // Processor brand string "microvm"
+            match leaf {
+                0x80000002 => (0x7263696D, 0x6D766F72, 0x00000000, 0x00000000), // "micr" "ovm\0"
+                0x80000003 => (0x00000000, 0x00000000, 0x00000000, 0x00000000),
+                0x80000004 => (0x00000000, 0x00000000, 0x00000000, 0x00000000),
+                _ => (0, 0, 0, 0),
+            }
+        }
+        0x80000008 => {
+            // Virtual/physical address sizes
+            // EAX: bits 7:0 = physical address bits (48), bits 15:8 = virtual address bits (48)
+            (0x00003030, 0, 0, 0)
+        }
+        _ => (0, 0, 0, 0),
+    }
+}
+
+/// Set up identity-mapped page tables for 64-bit long mode.
+/// Creates PML4 -> PDPT -> PD entries that identity map the first 1GB.
+#[cfg(target_arch = "x86_64")]
+fn setup_page_tables(memory: &mut [u8]) -> Result<(), Box<dyn std::error::Error>> {
+    // Page table layout at physical addresses:
+    // 0x1000: PML4 (Page Map Level 4)
+    // 0x2000: PDPT (Page Directory Pointer Table)
+    // 0x3000: PD (Page Directory) - maps first 1GB with 2MB pages
+
+    const PML4_ADDR: usize = 0x1000;
+    const PDPT_ADDR: usize = 0x2000;
+    const PD_ADDR: usize = 0x3000;
+
+    // Clear the page table area
+    for i in 0..(4 * 4096) {
+        if PML4_ADDR + i < memory.len() {
+            memory[PML4_ADDR + i] = 0;
+        }
+    }
+
+    // PML4[0] -> PDPT at 0x2000
+    // Flags: Present (1) | Writable (2) = 0x3
+    let pml4_entry: u64 = PDPT_ADDR as u64 | 0x3;
+    memory[PML4_ADDR..PML4_ADDR + 8].copy_from_slice(&pml4_entry.to_le_bytes());
+
+    // PDPT[0] -> PD at 0x3000
+    let pdpt_entry: u64 = PD_ADDR as u64 | 0x3;
+    memory[PDPT_ADDR..PDPT_ADDR + 8].copy_from_slice(&pdpt_entry.to_le_bytes());
+
+    // PD entries: Map first 1GB using 2MB pages (512 entries * 2MB = 1GB)
+    // Flags: Present (1) | Writable (2) | Page Size (0x80 for 2MB pages) = 0x83
+    for i in 0..512 {
+        let pd_entry: u64 = (i as u64 * 0x200000) | 0x83; // 2MB page, present, writable
+        let offset = PD_ADDR + i * 8;
+        if offset + 8 <= memory.len() {
+            memory[offset..offset + 8].copy_from_slice(&pd_entry.to_le_bytes());
+        }
+    }
+
+    Ok(())
+}
+
+/// Set up GDT (Global Descriptor Table) for 64-bit long mode.
+#[cfg(target_arch = "x86_64")]
+fn setup_gdt(memory: &mut [u8]) -> Result<(), Box<dyn std::error::Error>> {
+    use microvm::loader::x86_64::{GdtEntry, build_gdt};
+
+    const GDT_ADDR: usize = 0x500;
+
+    // Build GDT: null, code64, data64
+    let gdt = build_gdt();
+
+    // Write GDT to memory
+    if GDT_ADDR + gdt.len() <= memory.len() {
+        memory[GDT_ADDR..GDT_ADDR + gdt.len()].copy_from_slice(&gdt);
+    }
+
+    // GDT descriptor (GDTR) at 0x500 - 10 (i.e., 0x4F6)
+    // Note: The CPU will load this via LGDT instruction or we set GDTR register directly
+    // For WHP, we typically set the GDT base register directly in init_long_mode
 
     Ok(())
 }

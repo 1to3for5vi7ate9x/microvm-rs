@@ -77,12 +77,42 @@ SSH Client → vsock (SOCKS5) → microvm → OpenVPN → Target
 - [x] Linux kernel loader module (ARM64 Image + x86_64 bzImage)
 - [x] Device tree builder for ARM64 boot
 - [x] E820 memory map and GDT for x86_64 boot
+- [x] WHP backend for Windows (basic VM creation, memory, vCPU)
+- [x] **MILESTONE: hello_vm test working on Windows WHP!**
+- [x] WHP 64-bit long mode CPU setup
+- [x] WHP I/O port emulation (serial, PIT, PCI config)
+- [x] WHP CPUID emulation
+- [x] WHP APIC emulation configuration
+
+### Known Limitations
+
+#### Windows WHP MSR Handling Bug
+WHP has a significant limitation where MSR exits don't properly report the MSR number being accessed. The `MsrNumber` field in the exit context and the `ECX` register (which should contain the MSR number per x86 spec) both show 0 instead of the actual MSR number.
+
+**Investigation performed:**
+- Tried reading ECX register directly during MSR exits - WHP clears it to 0
+- Tried instruction decoding (looking for `mov ecx, imm32` patterns before RDMSR/WRMSR) - kernel uses indirect MSR access via paravirt
+- Tried reading MSR number from memory via RDX register (for `mov ecx, [rdx]` patterns) - the memory locations are uninitialized (contain 0)
+- QEMU's WHPX backend has the same issue and just returns 0 for all RDMSR and ignores all WRMSR
+
+**Impact:** Standard Linux kernels cannot boot because they rely on MSRs for:
+- CPU feature detection
+- APIC configuration
+- Timer calibration (TSC, kvmclock)
+- Paravirt operations
+
+**Workaround options:**
+1. Use a custom-built minimal kernel that avoids paravirt MSR patterns
+2. Use the KVM backend on Linux or HVF on macOS (both have proper MSR support)
+3. Wait for Microsoft to fix the WHP MSR handling
+4. Build kernel with `CONFIG_PARAVIRT=n` and minimal MSR usage
 
 ### What's Next
-- [ ] Test booting real Linux kernel
-- [ ] Port to Windows (WHP backend)
+- [ ] Boot real Linux kernel on macOS (HVF) - primary path forward
+- [ ] Port KVM backend for Linux
 - [ ] TAP backend for virtio-net
 - [ ] User-mode NAT/SOCKS backend
+- [ ] Investigate WHP MSR workarounds or wait for API improvements
 
 ---
 

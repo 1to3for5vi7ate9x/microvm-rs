@@ -169,17 +169,24 @@ impl GdtEntry {
     }
 }
 
-/// Build a minimal GDT for 64-bit mode.
+/// Build a minimal GDT for 64-bit mode (Linux boot protocol compatible).
 pub fn build_gdt() -> Vec<u8> {
     let mut gdt = Vec::new();
 
-    // Entry 0: Null descriptor
+    // Linux boot protocol requires:
+    // __BOOT_CS = 0x10 (entry 2)
+    // __BOOT_DS = 0x18 (entry 3)
+
+    // Entry 0: Null descriptor (selector 0x00)
     gdt.extend_from_slice(&GdtEntry::null().to_bytes());
 
-    // Entry 1: 64-bit code segment (selector 0x08)
+    // Entry 1: Reserved/null descriptor (selector 0x08)
+    gdt.extend_from_slice(&GdtEntry::null().to_bytes());
+
+    // Entry 2: 64-bit code segment (selector 0x10 = __BOOT_CS)
     gdt.extend_from_slice(&GdtEntry::code64().to_bytes());
 
-    // Entry 2: 64-bit data segment (selector 0x10)
+    // Entry 3: 64-bit data segment (selector 0x18 = __BOOT_DS)
     gdt.extend_from_slice(&GdtEntry::data64().to_bytes());
 
     gdt
@@ -205,7 +212,7 @@ mod tests {
     #[test]
     fn test_build_gdt() {
         let gdt = build_gdt();
-        assert_eq!(gdt.len(), 24); // 3 entries * 8 bytes
+        assert_eq!(gdt.len(), 32); // 4 entries * 8 bytes
     }
 
     #[test]

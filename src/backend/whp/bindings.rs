@@ -53,16 +53,25 @@ pub fn whp_result(result: windows::core::HRESULT) -> crate::error::Result<()> {
     }
 }
 
-// Exit reasons
+// Exit reasons from Windows SDK (WinHvPlatformDefs.h)
+// These are the actual hex values from the Windows API
 #[cfg(target_os = "windows")]
 pub mod exit_reason {
-    pub const WHV_RUN_VP_EXIT_REASON_NONE: i32 = 0;
-    pub const WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS: i32 = 1;
-    pub const WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS: i32 = 2;
-    pub const WHV_RUN_VP_EXIT_REASON_UNRECOVERABLE_EXCEPTION: i32 = 4;
-    pub const WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE: i32 = 5;
-    pub const WHV_RUN_VP_EXIT_REASON_UNSUPPORTED_FEATURE: i32 = 6;
-    pub const WHV_RUN_VP_EXIT_REASON_X64_INTERRUPTION_DELIVERABLE: i32 = 7;
-    pub const WHV_RUN_VP_EXIT_REASON_X64_HALT: i32 = 10;
-    pub const WHV_RUN_VP_EXIT_REASON_CANCELED: i32 = 14;
+    pub const WHV_RUN_VP_EXIT_REASON_NONE: i32 = 0x0000;
+    pub const WHV_RUN_VP_EXIT_REASON_MEMORY_ACCESS: i32 = 0x0001;
+    pub const WHV_RUN_VP_EXIT_REASON_X64_IO_PORT_ACCESS: i32 = 0x0002;
+    pub const WHV_RUN_VP_EXIT_REASON_EXCEPTION: i32 = 0x0003;  // Intercepted exception
+    pub const WHV_RUN_VP_EXIT_REASON_UNRECOVERABLE_EXCEPTION: i32 = 0x0004;
+    pub const WHV_RUN_VP_EXIT_REASON_INVALID_VP_REGISTER_VALUE: i32 = 0x0005;
+    pub const WHV_RUN_VP_EXIT_REASON_UNSUPPORTED_FEATURE: i32 = 0x0006;
+    pub const WHV_RUN_VP_EXIT_REASON_X64_INTERRUPTION_DELIVERABLE: i32 = 0x0007;
+    pub const WHV_RUN_VP_EXIT_REASON_X64_HALT: i32 = 0x0008;
+    pub const WHV_RUN_VP_EXIT_REASON_X64_APIC_EOI: i32 = 0x0009;
+    pub const WHV_RUN_VP_EXIT_REASON_SYNIC_SINT_DELIVERABLE: i32 = 0x000A;
+    pub const WHV_RUN_VP_EXIT_REASON_X64_CPUID: i32 = 0x1000;
+    pub const WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS: i32 = 0x1001;
+    pub const WHV_RUN_VP_EXIT_REASON_X64_RDTSC: i32 = 0x1002;
+    pub const WHV_RUN_VP_EXIT_REASON_X64_APIC_SMI: i32 = 0x1003;
+    pub const WHV_RUN_VP_EXIT_REASON_HYPERCALL: i32 = 0x1004;
+    pub const WHV_RUN_VP_EXIT_REASON_CANCELED: i32 = 0x2001;
 }

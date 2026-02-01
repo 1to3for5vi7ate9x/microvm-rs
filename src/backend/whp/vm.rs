@@ -1,9 +1,9 @@
 //! WHP VM management.
-//!
-//! TODO: Implement on Windows machine.
 
 use crate::backend::VmConfig;
 use crate::error::{Error, Result};
+use super::memory::GuestMemory;
+use super::vcpu::Vcpu;
 
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Hypervisor::*;
@@ -16,7 +16,10 @@ pub struct Vm {
     #[cfg(not(target_os = "windows"))]
     _phantom: std::marker::PhantomData<()>,
 
-    memory_size: usize,
+    /// Guest physical memory
+    memory: GuestMemory,
+    /// Virtual CPUs
+    vcpus: Vec<Vcpu>,
     vcpu_count: u32,
 }
 
@@ -27,8 +30,7 @@ impl Vm {
         {
             unsafe {
                 // Create partition
-                let mut partition = WHV_PARTITION_HANDLE::default();
-                WHvCreatePartition(&mut partition).map_err(|e| {
+                let partition = WHvCreatePartition().map_err(|e| {
                     Error::HypervisorError(format!("Failed to create partition: {:?}", e))
                 })?;
 
@@ -46,30 +48,54 @@ impl Vm {
                     Error::HypervisorError(format!("Failed to set processor count: {:?}", e))
                 })?;
 
+                // Enable extended VM exits for CPUID only
+                // NOTE: WHP has a known limitation where MSR exits don't properly report
+                // the MSR number being accessed (MsrNumber field and RCX register often show 0).
+                // This causes issues with Linux kernel boot which heavily uses MSRs.
+                // Setting bit 1 (X64MsrExit) doesn't help as WHP still intercepts certain
+                // MSRs regardless of this setting. The kernel gets stuck in MSR polling loops
+                // because we can't properly emulate the MSRs it's trying to access.
+                let mut extended_exits = WHV_PARTITION_PROPERTY::default();
+                // WHV_EXTENDED_VM_EXITS bitfield:
+                // Bit 0: X64CpuidExit, Bit 1: X64MsrExit, Bit 2: ExceptionExit, Bit 3: X64RdtscExit
+                extended_exits.ExtendedVmExits.Anonymous._bitfield = 0x1; // CPUID exits only
+                WHvSetPartitionProperty(
+                    partition,
+                    WHvPartitionPropertyCodeExtendedVmExits,
+                    &extended_exits as *const _ as *const _,
+                    std::mem::size_of::<WHV_PARTITION_PROPERTY>() as u32,
+                )
+                .map_err(|e| {
+                    Error::HypervisorError(format!("Failed to enable extended VM exits: {:?}", e))
+                })?;
+
+                // Enable Local APIC emulation in xAPIC mode
+                // This is needed for timer interrupts and proper kernel boot
+                let mut apic_mode = WHV_PARTITION_PROPERTY::default();
+                apic_mode.LocalApicEmulationMode = WHV_X64_LOCAL_APIC_EMULATION_MODE(1); // xAPIC mode
+                WHvSetPartitionProperty(
+                    partition,
+                    WHvPartitionPropertyCodeLocalApicEmulationMode,
+                    &apic_mode as *const _ as *const _,
+                    std::mem::size_of::<WHV_PARTITION_PROPERTY>() as u32,
+                )
+                .map_err(|e| {
+                    Error::HypervisorError(format!("Failed to set APIC emulation mode: {:?}", e))
+                })?;
+
                 // Setup partition
                 WHvSetupPartition(partition).map_err(|e| {
                     Error::HypervisorError(format!("Failed to setup partition: {:?}", e))
                 })?;
 
-                // Allocate and map guest memory
+                // Allocate guest memory
                 let memory_size = (config.memory_mb as usize) * 1024 * 1024;
-                let guest_memory = VirtualAlloc(
-                    None,
-                    memory_size,
-                    MEM_COMMIT | MEM_RESERVE,
-                    PAGE_READWRITE,
-                );
+                let memory = GuestMemory::new(memory_size)?;
 
-                if guest_memory.is_null() {
-                    return Err(Error::MemoryAllocationFailed(
-                        "VirtualAlloc failed".to_string(),
-                    ));
-                }
-
-                // Map memory to guest
+                // Map memory to guest physical address space
                 WHvMapGpaRange(
                     partition,
-                    guest_memory,
+                    memory.as_ptr() as *const std::ffi::c_void,
                     0, // Guest physical address
                     memory_size as u64,
                     WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite | WHvMapGpaRangeFlagExecute,
@@ -79,6 +105,7 @@ impl Vm {
                 })?;
 
                 // Create virtual processors
+                let mut vcpus = Vec::with_capacity(config.vcpus as usize);
                 for vp_index in 0..config.vcpus {
                     WHvCreateVirtualProcessor(partition, vp_index, 0).map_err(|e| {
                         Error::HypervisorError(format!(
@@ -86,11 +113,13 @@ impl Vm {
                             vp_index, e
                         ))
                     })?;
+                    vcpus.push(Vcpu::new(partition, vp_index));
                 }
 
                 Ok(Self {
                     partition,
-                    memory_size,
+                    memory,
+                    vcpus,
                     vcpu_count: config.vcpus,
                 })
             }
@@ -98,9 +127,35 @@ impl Vm {
 
         #[cfg(not(target_os = "windows"))]
         {
+            let _ = config;
             // Stub for non-Windows platforms
             Err(Error::HypervisorNotAvailable)
         }
+    }
+
+    /// Get a reference to guest memory.
+    pub fn memory(&self) -> &GuestMemory {
+        &self.memory
+    }
+
+    /// Get a mutable reference to guest memory.
+    pub fn memory_mut(&mut self) -> &mut GuestMemory {
+        &mut self.memory
+    }
+
+    /// Get a reference to a vCPU by index.
+    pub fn vcpu(&self, index: usize) -> Option<&Vcpu> {
+        self.vcpus.get(index)
+    }
+
+    /// Get a mutable reference to a vCPU by index.
+    pub fn vcpu_mut(&mut self, index: usize) -> Option<&mut Vcpu> {
+        self.vcpus.get_mut(index)
+    }
+
+    /// Get the number of vCPUs.
+    pub fn vcpu_count(&self) -> u32 {
+        self.vcpu_count
     }
 
     /// Start the VM.

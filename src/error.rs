@@ -33,7 +33,7 @@ pub enum Error {
     KernelNotFound(PathBuf),
 
     #[error("invalid kernel format: {0}")]
-    InvalidKernel(PathBuf),
+    InvalidKernel(String),
 
     #[error("rootfs not found: {0}")]
     RootfsNotFound(PathBuf),

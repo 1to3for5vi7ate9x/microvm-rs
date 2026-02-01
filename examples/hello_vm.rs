@@ -302,7 +302,119 @@ mod arm64_reg_ext {
     pub const HV_REG_X0: u32 = 0;
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
 fn run_hello_vm() {
-    println!("This example only runs on macOS (HVF backend)");
+    use microvm::backend::whp;
+
+    println!("\nCreating WHP VM...");
+
+    let config = microvm::backend::VmConfig {
+        memory_mb: 64,
+        vcpus: 1,
+        kernel: None,
+        initrd: None,
+        rootfs: None,
+        cmdline: String::new(),
+    };
+
+    let mut vm = match whp::Vm::new(&config) {
+        Ok(vm) => {
+            println!("  VM created successfully");
+            vm
+        }
+        Err(e) => {
+            eprintln!("  Failed to create VM: {}", e);
+            return;
+        }
+    };
+
+    run_x86_64_test_whp(&mut vm);
+}
+
+#[cfg(target_os = "windows")]
+fn run_x86_64_test_whp(vm: &mut microvm::backend::whp::Vm) {
+    use microvm::backend::whp::VcpuExit;
+    use std::io::Write;
+    use windows::Win32::System::Hypervisor::*;
+
+    // x86 machine code that writes "Hi!\n" to serial port 0x3f8 and halts
+    // This is 16-bit real mode code for simplicity
+    let code: Vec<u8> = vec![
+        // mov dx, 0x3f8 (serial port)
+        0xBA, 0xF8, 0x03,
+        // mov al, 'H'
+        0xB0, 0x48,
+        // out dx, al
+        0xEE,
+        // mov al, 'i'
+        0xB0, 0x69,
+        // out dx, al
+        0xEE,
+        // mov al, '!'
+        0xB0, 0x21,
+        // out dx, al
+        0xEE,
+        // mov al, '\n'
+        0xB0, 0x0A,
+        // out dx, al
+        0xEE,
+        // hlt
+        0xF4,
+    ];
+
+    let load_addr = 0x1000usize;
+    println!("  Loading x86_64 code at 0x{:x} ({} bytes)", load_addr, code.len());
+
+    vm.memory_mut().write(load_addr, &code).unwrap();
+
+    // Initialize vCPU in real mode
+    if let Some(vcpu) = vm.vcpu_mut(0) {
+        // Set up real mode
+        vcpu.init_real_mode().unwrap();
+        // Set RIP to our code
+        vcpu.write_register(WHvX64RegisterRip, load_addr as u64).unwrap();
+        println!("  vCPU initialized in real mode, RIP=0x{:x}", load_addr);
+    }
+
+    println!("\nRunning VM...\n--- Guest output ---");
+
+    // Run vCPU loop
+    for _ in 0..1000 {
+        let vcpu = vm.vcpu_mut(0).unwrap();
+
+        match vcpu.run() {
+            Ok(VcpuExit::IoOut { port, data, instruction_len }) => {
+                if port == 0x3f8 {
+                    for byte in &data {
+                        print!("{}", *byte as char);
+                    }
+                    let _ = std::io::stdout().flush();
+                }
+                vcpu.advance_rip(instruction_len as u64).unwrap();
+            }
+            Ok(VcpuExit::IoIn { port: _, size: _, instruction_len }) => {
+                vcpu.set_rax(0).unwrap();
+                vcpu.advance_rip(instruction_len as u64).unwrap();
+            }
+            Ok(VcpuExit::Hlt) => {
+                println!("\n--- Guest halted ---");
+                break;
+            }
+            Ok(exit) => {
+                println!("\n[Unexpected exit: {:?}]", exit);
+                break;
+            }
+            Err(e) => {
+                eprintln!("\n--- vCPU error: {} ---", e);
+                break;
+            }
+        }
+    }
+
+    println!("\nVM test completed!");
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn run_hello_vm() {
+    println!("This example only runs on macOS (HVF) or Windows (WHP)");
 }

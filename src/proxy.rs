@@ -158,6 +158,10 @@ impl ConnectRequest {
 ///
 /// This runs in a separate thread and handles connections from the guest's
 /// outbound-proxy via vsock.
+///
+/// Note: This struct uses raw file descriptors and is only available on Unix platforms.
+/// For cross-platform code, use `ProxyConnectionManager` instead.
+#[cfg(unix)]
 pub struct OutboundProxy {
     /// Active TCP connections (conn_key -> TcpStream)
     connections: Arc<Mutex<HashMap<u64, TcpStream>>>,
@@ -165,6 +169,7 @@ pub struct OutboundProxy {
     running: Arc<std::sync::atomic::AtomicBool>,
 }
 
+#[cfg(unix)]
 impl OutboundProxy {
     /// Create a new outbound proxy.
     pub fn new() -> Self {
@@ -429,6 +434,7 @@ impl OutboundProxy {
     }
 }
 
+#[cfg(unix)]
 impl Default for OutboundProxy {
     fn default() -> Self {
         Self::new()
@@ -705,6 +711,16 @@ pub fn create_vsock_listener(port: u32) -> io::Result<i32> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "Host vsock listener not directly supported on macOS - use VmRuntime integration"
+    ))
+}
+
+#[cfg(target_os = "windows")]
+pub fn create_vsock_listener(_port: u32) -> io::Result<i32> {
+    // Windows uses Hyper-V sockets (AF_HYPERV) for VM communication.
+    // This is handled differently through the WHP backend.
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Host vsock listener not directly supported on Windows - use VmRuntime integration"
     ))
 }
 
