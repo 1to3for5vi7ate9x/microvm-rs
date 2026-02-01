@@ -48,17 +48,13 @@ impl Vm {
                     Error::HypervisorError(format!("Failed to set processor count: {:?}", e))
                 })?;
 
-                // Enable extended VM exits for CPUID only
-                // NOTE: WHP has a known limitation where MSR exits don't properly report
-                // the MSR number being accessed (MsrNumber field and RCX register often show 0).
-                // This causes issues with Linux kernel boot which heavily uses MSRs.
-                // Setting bit 1 (X64MsrExit) doesn't help as WHP still intercepts certain
-                // MSRs regardless of this setting. The kernel gets stuck in MSR polling loops
-                // because we can't properly emulate the MSRs it's trying to access.
+                // Enable extended VM exits for CPUID and MSR
+                // We enable MSR exits so we can handle unimplemented MSRs gracefully
+                // instead of having WHP inject GP faults into the guest.
                 let mut extended_exits = WHV_PARTITION_PROPERTY::default();
                 // WHV_EXTENDED_VM_EXITS bitfield:
                 // Bit 0: X64CpuidExit, Bit 1: X64MsrExit, Bit 2: ExceptionExit, Bit 3: X64RdtscExit
-                extended_exits.ExtendedVmExits.Anonymous._bitfield = 0x1; // CPUID exits only
+                extended_exits.ExtendedVmExits.Anonymous._bitfield = 0x3; // CPUID + MSR exits
                 WHvSetPartitionProperty(
                     partition,
                     WHvPartitionPropertyCodeExtendedVmExits,
@@ -67,6 +63,21 @@ impl Vm {
                 )
                 .map_err(|e| {
                     Error::HypervisorError(format!("Failed to enable extended VM exits: {:?}", e))
+                })?;
+
+                // Configure unimplemented MSR action to exit to VMM instead of GP fault
+                // This allows us to handle unknown MSRs gracefully
+                let mut msr_action = WHV_PARTITION_PROPERTY::default();
+                // WHV_MSR_ACTION: 0 = GP fault, 1 = Exit to VMM
+                msr_action.UnimplementedMsrAction = WHV_MSR_ACTION(1);
+                WHvSetPartitionProperty(
+                    partition,
+                    WHvPartitionPropertyCodeUnimplementedMsrAction,
+                    &msr_action as *const _ as *const _,
+                    std::mem::size_of::<WHV_PARTITION_PROPERTY>() as u32,
+                )
+                .map_err(|e| {
+                    Error::HypervisorError(format!("Failed to set MSR action: {:?}", e))
                 })?;
 
                 // Enable Local APIC emulation in xAPIC mode

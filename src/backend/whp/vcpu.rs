@@ -337,7 +337,7 @@ impl Vcpu {
                     // Debug: Print MSR access info (limit output)
                     static DEBUG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                     let count = DEBUG_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    if count < 20 {
+                    if count < 50 {
                         let rip = exit_context.VpContext.Rip;
                         if is_write {
                             eprintln!("[MSR] 0x{:x} WRITE msr=0x{:x} (RCX=0x{:x}, RAX=0x{:x}, RDX=0x{:x}, len={})",

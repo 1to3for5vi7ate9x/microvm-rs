@@ -1457,9 +1457,22 @@ fn run_vm_loop(
     const PCI_CONFIG_ADDR: u16 = 0xCF8;  // PCI config address
     const PCI_CONFIG_DATA: u16 = 0xCFC;  // PCI config data (also 0xCFD, 0xCFE, 0xCFF)
 
-    // Simple PIT state for timer calibration
-    // The kernel reads the counter repeatedly to measure time
-    let mut pit_counter: u16 = 0xFFFF;
+    // PIT (Programmable Interval Timer) state for timer calibration
+    // The PIT runs at 1.193182 MHz, so it ticks ~1193 times per millisecond
+    // The kernel reads the counter repeatedly to measure time and calibrate TSC
+    //
+    // IMPORTANT: The kernel calculates CPU speed as:
+    //   cpu_hz = (tsc2 - tsc1) * PIT_TICK_RATE / (pit1 - pit2)
+    // If (pit1 - pit2) is 0, we get division by zero!
+    //
+    // We use a global tick counter that both PIT and TSC reference to ensure
+    // consistent timing between the two.
+    static GLOBAL_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    // PIT reload value (set by kernel, defaults to max)
+    let mut pit_reload: u16 = 0xFFFF;
+    // Track the last "read" tick for PIT countdown simulation
+    let mut pit_last_read_tick: u64 = 0;
 
     println!("Starting WHP VM execution...");
     let mut exit_count = 0;
@@ -1555,8 +1568,20 @@ fn run_vm_loop(
                         // PIT command - just ignore, we don't fully emulate the PIT
                     }
                     PIT_CH0 | PIT_CH1 | PIT_CH2 => {
-                        // PIT counter write - reset counter or set reload value
-                        pit_counter = 0xFFFF;
+                        // PIT counter write - set reload value
+                        if !data.is_empty() {
+                            // Typically kernel writes 0 or 0xFFFF
+                            pit_reload = if data.len() >= 2 {
+                                u16::from_le_bytes([data[0], data[1]])
+                            } else {
+                                data[0] as u16
+                            };
+                            if pit_reload == 0 {
+                                pit_reload = 0xFFFF; // 0 means max count
+                            }
+                        }
+                        // Reset the counter on write
+                        pit_last_read_tick = GLOBAL_TICK.load(std::sync::atomic::Ordering::SeqCst);
                     }
                     PCI_CONFIG_ADDR => {
                         // PCI config address write - ignore for now
@@ -1589,8 +1614,21 @@ fn run_vm_loop(
                     }
                     PIT_CH0 | PIT_CH1 | PIT_CH2 => {
                         // PIT counter read - return decreasing value for timer calibration
-                        // Decrement counter by a reasonable amount to simulate time passing
-                        pit_counter = pit_counter.wrapping_sub(100);
+                        // The global tick increments on each RDTSC, and PIT counts down
+                        // proportionally to simulate realistic timing.
+                        //
+                        // Relationship: ~1675 TSC ticks per PIT tick (2GHz TSC / 1.19MHz PIT)
+                        // So every 1675 TSC increments = 1 PIT decrement
+                        let current_tick = GLOBAL_TICK.load(std::sync::atomic::Ordering::SeqCst);
+
+                        // Each GLOBAL_TICK increment represents ~1000 TSC ticks
+                        // PIT decrements: tick_delta * 1000 / 1675 ≈ tick_delta * 0.597
+                        let tick_delta = current_tick.saturating_sub(pit_last_read_tick);
+                        let pit_decrements = (tick_delta * 600 / 1000) as u16;
+
+                        // Calculate current counter value (wrapping)
+                        let pit_counter = pit_reload.wrapping_sub(pit_decrements % (pit_reload + 1));
+
                         if size == 1 {
                             // 8-bit read (depends on latch state, simplified)
                             vcpu.set_rax((pit_counter & 0xFF) as u64)?;
@@ -1704,8 +1742,24 @@ fn run_vm_loop(
             }
             VcpuExit::Rdtsc { instruction_len } => {
                 // Return an increasing TSC value to simulate time passing
+                // We also increment GLOBAL_TICK which the PIT uses to stay synchronized
+                //
+                // Each RDTSC represents ~1000 TSC ticks of actual execution time
+                // At 2GHz, this is about 0.5 microseconds per RDTSC call
+                GLOBAL_TICK.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
                 static TSC_VALUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let tsc = TSC_VALUE.fetch_add(1_000_000, std::sync::atomic::Ordering::SeqCst);
+                static RDTSC_LOG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+                // Increment by ~1000 ticks per call (simulating a tight loop)
+                let tsc = TSC_VALUE.fetch_add(1000, std::sync::atomic::Ordering::SeqCst);
+
+                // Log first few RDTSC calls
+                if RDTSC_LOG.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 10 {
+                    let rip = vcpu.read_register(WHvX64RegisterRip).unwrap_or(0);
+                    eprintln!("[RDTSC] RIP=0x{:x} -> 0x{:x}", rip, tsc);
+                }
+
                 // RDTSC returns result in EDX:EAX
                 vcpu.write_register(WHvX64RegisterRax, tsc & 0xFFFFFFFF)?;
                 vcpu.write_register(WHvX64RegisterRdx, tsc >> 32)?;
@@ -1882,6 +1936,13 @@ fn handle_msr_read(msr: u32) -> u64 {
         0x0 => {
             MSR0_COUNTER.fetch_add(0x100000, std::sync::atomic::Ordering::SeqCst)
         }
+        // IA32_TSC (0x10) - Time Stamp Counter
+        // This should return the same value as RDTSC for consistency
+        0x10 => {
+            // Use the same TSC value as RDTSC
+            static TSC_MSR_VALUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            TSC_MSR_VALUE.fetch_add(1000, std::sync::atomic::Ordering::SeqCst)
+        }
         // IA32_APIC_BASE
         0x1B => 0xFEE00900,
         // IA32_MTRRCAP
@@ -1981,9 +2042,10 @@ fn handle_cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
             // Processor info and features
             let eax = 0x000506E3; // Family 6, Model 94 (Skylake-like)
             let ebx = 0x00100800; // CLFLUSH=8, APIC ID=0, 1 logical processor
-            // ECX features: SSE3 + HYPERVISOR bit (bit 31)
-            // Bit 31 (0x80000000) = Hypervisor present - tells guest it's in a VM
-            let ecx = 0x80000201; // SSE3 + Hypervisor present
+            // ECX features: SSE3 (bit 0), SSE4.1 (bit 19), SSE4.2 (bit 20), POPCNT (bit 23), TSC-Deadline (bit 24), XSAVE (bit 26)
+            // NOTE: Hypervisor bit (bit 31) DISABLED to prevent Linux from expecting
+            // enlightenment features we don't fully implement
+            let ecx = 0x00000201; // SSE3 only, no hypervisor present
             // EDX features: FPU, VME, DE, PSE, TSC, MSR, PAE, MCE, CX8, APIC, SEP, MTRR, PGE, MCA, CMOV, PAT, PSE36, CLFSH, MMX, FXSR, SSE, SSE2
             let edx = 0x178BFBFF;
             (eax, ebx, ecx, edx)
@@ -2048,13 +2110,16 @@ fn handle_cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
 
         0x40000000 => {
             // Hypervisor CPUID leaf range and vendor signature
-            // EAX = Maximum hypervisor CPUID leaf
-            // EBX:ECX:EDX = "Microsoft Hv" signature
-            let eax = 0x40000006; // Max leaf we support
-            let ebx = 0x7263694D; // "Micr"
-            let ecx = 0x666F736F; // "osof"
-            let edx = 0x76482074; // "t Hv"
-            (eax, ebx, ecx, edx)
+            // DISABLED: Advertising Hyper-V can cause issues if we don't fully implement
+            // all the required synthetic MSRs. Return zeros to make Linux treat us as
+            // a generic hypervisor or bare metal.
+            //
+            // To re-enable Hyper-V enlightenment, uncomment:
+            // let eax = 0x40000006; // Max leaf we support
+            // let ebx = 0x7263694D; // "Micr"
+            // let ecx = 0x666F736F; // "osof"
+            // let edx = 0x76482074; // "t Hv"
+            (0, 0, 0, 0)
         }
         0x40000001 => {
             // Hypervisor vendor-neutral interface identification
