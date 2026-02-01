@@ -1,0 +1,210 @@
+  Command to Test Microvm Bootup
+
+  Here's the command to test the kernel boot:
+
+  # Basic boot test
+  target/debug/microvm.exe run --kernel vm/vmlinuz-lts --initrd vm/initramfs-lts --memory 
+  512 --cpus 1 --cmdline "console=ttyS0 earlyprintk=serial,ttyS0,115200"
+
+  # With timeout (30 seconds)
+  timeout 30 target/debug/microvm.exe run --kernel vm/vmlinuz-lts --initrd
+  vm/initramfs-lts --memory 512 --cpus 1 --cmdline "console=ttyS0
+  earlyprintk=serial,ttyS0,115200"
+
+  # Test hello_vm example (this DOES work)
+  cargo run --example hello_vm
+
+  The hello_vm example works and prints "Hi!" - basic WHP execution is fine. The issue is 
+  specifically with booting a full Linux kernel due to the MSR handling limitations. 
+
+
+--------------------------------------------------------------------------------------------------
+
+ What are MSRs and Why the Linux Kernel Needs Them                                         
+  What is an MSR?                                                                            
+  MSR = Model Specific Register                                                           
+  
+  These are special CPU registers that control low-level CPU features. Unlike
+  general-purpose registers (RAX, RBX, etc.), MSRs are accessed with special instructions:
+  - RDMSR - Read from MSR (MSR number in ECX, result in EDX:EAX)
+  - WRMSR - Write to MSR (MSR number in ECX, value in EDX:EAX)
+
+  What MSRs Control
+
+  MSR 0x10        - TSC (Time Stamp Counter) - for timing/clocks
+  MSR 0x1B        - APIC Base - interrupt controller configuration
+  MSR 0x174-0x176 - SYSENTER - fast system call mechanism
+  MSR 0xC0000080  - EFER - enables 64-bit long mode
+  MSR 0xC0000081  - STAR - syscall target address
+  MSR 0xC0000082  - LSTAR - 64-bit syscall handler address
+
+  Why the Linux Kernel MUST Use MSRs
+
+  During boot, the kernel does this:
+
+  1. Detect CPU features      → Reads MSRs to check what CPU supports
+  2. Setup interrupts (APIC)  → Writes APIC MSRs to configure interrupt delivery
+  3. Setup system calls       → Writes SYSCALL/SYSENTER MSRs
+  4. Calibrate timers         → Reads TSC MSR repeatedly to measure time
+  5. Enable CPU features      → Writes EFER, CR4, etc.
+
+  Without MSRs, the kernel cannot:
+  - Know what time it is
+  - Handle interrupts (keyboard, disk, network)
+  - Handle system calls (any program calling the OS)
+  - Know what CPU features exist
+
+  ---
+  The WHP Bug Explained
+
+  Normal Hypervisor Behavior (KVM, HVF)
+
+  Guest runs: mov ecx, 0x1B    ; MSR number = APIC_BASE
+              rdmsr            ; Read MSR 0x1B
+
+  Hypervisor receives:
+    - Exit reason: MSR_READ
+    - MSR number: 0x1B         ← Hypervisor knows WHICH MSR
+    - Can return correct value for APIC_BASE
+
+  WHP Broken Behavior
+
+  Guest runs: mov ecx, 0x1B    ; MSR number = APIC_BASE
+              rdmsr            ; Read MSR 0x1B
+
+  WHP reports:
+    - Exit reason: MSR_READ
+    - MSR number: 0x0          ← WRONG! Should be 0x1B
+    - ECX register: 0x0        ← ALSO WRONG! WHP cleared it
+
+  We don't know which MSR was accessed!
+
+  ---
+  Why We Can't Work Around It
+
+  Attempt 1: Read ECX Register
+
+  Idea: ECX should contain MSR number per x86 spec
+  Result: WHP clears ECX to 0 before giving us the exit
+  Status: FAILED
+
+  Attempt 2: Decode Instructions
+
+  Idea: Look at code before RDMSR to find "mov ecx, 0x1B"
+
+  Normal code:
+    mov ecx, 0x1B      ; B9 1B 00 00 00  ← We can find this!
+    rdmsr
+
+  Linux kernel actual code:
+    mov ecx, [rdx]     ; 8B 0A  ← MSR number loaded from memory!
+    rdmsr
+
+  The kernel uses INDIRECT access - MSR number is in a data structure,
+  not hardcoded in the instruction.
+
+  Status: FAILED
+
+  Attempt 3: Read Memory at [RDX]
+
+  Idea: If "mov ecx, [rdx]", read the MSR number from memory[rdx]
+
+  Result:
+    RDX = 0xffffffffb2803db0  (kernel virtual address)
+    Translated to physical: 0x18803db0
+    Memory at that address: 0x00000000  ← All zeros!
+
+  The kernel's paravirt data structures aren't initialized yet
+  when these MSR accesses happen during early boot.
+
+  Status: FAILED
+
+  Attempt 4: Just Return 0 for Everything
+
+  Idea: Return 0 for all RDMSR, ignore all WRMSR (QEMU's approach)
+
+  Result: Kernel loops forever waiting for specific MSR values
+          
+  Example: Kernel reads TSC MSR in a loop waiting for time to pass
+           We return 0 every time
+           Kernel thinks no time has passed
+           Kernel loops forever
+
+  Status: PARTIAL - kernel boots further but gets stuck
+
+  ---
+  Visual Summary
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │                     LINUX KERNEL BOOT                        │
+  ├─────────────────────────────────────────────────────────────┤
+  │                                                              │
+  │  1. "What CPU do I have?"                                   │
+  │      └── RDMSR various MSRs ──► WHP says MSR=0 ──► ???     │
+  │                                                              │
+  │  2. "Setup APIC for interrupts"                             │
+  │      └── WRMSR 0x1B ──► WHP says MSR=0 ──► We ignore it    │
+  │      └── Interrupts don't work properly                     │
+  │                                                              │
+  │  3. "Calibrate system timer"                                │
+  │      └── RDMSR TSC in loop ──► We return 0 ──► Infinite loop│
+  │                                                              │
+  │  4. KERNEL STUCK HERE ─────────────────────────────────────│
+  │                                                              │
+  └─────────────────────────────────────────────────────────────┘
+
+  ---
+  Why Other Hypervisors Work
+  ┌───────────────┬─────────────────────┬────────┐
+  │  Hypervisor   │ MSR Number Reported │ Status │
+  ├───────────────┼─────────────────────┼────────┤
+  │ KVM (Linux)   │ ✅ Correct          │ Works  │
+  ├───────────────┼─────────────────────┼────────┤
+  │ HVF (macOS)   │ ✅ Correct          │ Works  │
+  ├───────────────┼─────────────────────┼────────┤
+  │ WHP (Windows) │ ❌ Always 0         │ Broken │
+  └───────────────┴─────────────────────┴────────┘
+  This is a Microsoft bug in WHP, not something we can fix in our code.
+
+  ---
+  What Actually Works on WHP
+
+  Simple code that doesn't use MSRs works fine:
+
+  // Our hello_vm test - this WORKS on WHP!
+  let code = [
+      0xB0, 0x48,       // mov al, 'H'
+      0xE6, 0x3F8,      // out 0x3F8, al  (serial port)
+      0xB0, 0x69,       // mov al, 'i'
+      0xE6, 0x3F8,      // out 0x3F8, al
+      0xF4,             // hlt
+  ];
+  // Output: "Hi!" ✅
+
+  Linux kernel - uses MSRs everywhere - FAILS on WHP
+
+---
+VM Files (in vm/ folder - not tracked in git due to size)
+
+Kernels:
+- vmlinuz-lts      (11.4 MB) - Alpine Linux LTS kernel (recommended for testing)
+- vmlinuz          (32.8 MB) - Full Linux kernel
+- vmlinuz-virt     (32.8 MB) - Virtualization-optimized kernel
+- vmlinux-5.10     (41.4 MB) - Uncompressed Linux 5.10 kernel
+- bzImage          (290 KB)  - Minimal test kernel
+- bzImage-x86      (290 KB)  - Minimal x86 test kernel
+
+Initramfs:
+- initramfs-lts              (26.6 MB) - Alpine Linux initramfs (use with vmlinuz-lts)
+- initramfs.img              (4.7 MB)  - Basic initramfs
+- initramfs-virt.img         (1.4 MB)  - Minimal virt initramfs
+- initramfs-velocitty.cpio.gz (1.2 MB) - Velocitty custom initramfs
+- initramfs-x86.cpio.gz      (290 KB)  - Minimal x86 initramfs
+- initramfs-x86-min.cpio.gz  (26.6 MB) - x86 minimal initramfs
+
+Scripts/Config:
+- daemon.py                  - Velocitty VM daemon
+- start-vm.sh               - VM startup script
+- velocitty-network.yaml    - Lima/Velocitty network config
+
+Download these files separately or copy from macOS machine.
