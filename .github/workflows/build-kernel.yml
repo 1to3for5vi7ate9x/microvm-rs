@@ -1,0 +1,258 @@
+name: Build Minimal Kernel for WHP
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'kernel-config/**'
+      - '.github/workflows/build-kernel.yml'
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libncurses-dev \
+            bison \
+            flex \
+            libssl-dev \
+            libelf-dev \
+            bc \
+            wget \
+            cpio \
+            gzip
+
+      - name: Download Linux kernel source
+        run: |
+          KERNEL_VERSION=6.1.90
+          wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VERSION}.tar.xz
+          tar xf linux-${KERNEL_VERSION}.tar.xz
+          mv linux-${KERNEL_VERSION} linux
+
+      - name: Create minimal kernel config
+        run: |
+          cd linux
+          # Start with allnoconfig (minimal config)
+          make allnoconfig
+
+          # Enable essential features for x86_64 boot
+          cat >> .config << 'EOF'
+          # Basic x86_64 support
+          CONFIG_64BIT=y
+          CONFIG_X86_64=y
+          CONFIG_SMP=n
+          CONFIG_PREEMPT_NONE=y
+
+          # Processor type
+          CONFIG_GENERIC_CPU=y
+          CONFIG_X86_TSC=y
+
+          # Boot and ELF support
+          CONFIG_ELF_CORE=y
+          CONFIG_BINFMT_ELF=y
+          CONFIG_KERNEL_GZIP=y
+
+          # Console/TTY support
+          CONFIG_TTY=y
+          CONFIG_VT=y
+          CONFIG_CONSOLE_TRANSLATIONS=y
+          CONFIG_VT_CONSOLE=y
+          CONFIG_UNIX98_PTYS=y
+          CONFIG_LEGACY_PTYS=n
+
+          # Serial console (critical for microvm)
+          CONFIG_SERIAL_8250=y
+          CONFIG_SERIAL_8250_CONSOLE=y
+          CONFIG_SERIAL_CORE=y
+          CONFIG_SERIAL_CORE_CONSOLE=y
+
+          # Basic printk
+          CONFIG_PRINTK=y
+          CONFIG_PRINTK_TIME=y
+          CONFIG_EARLY_PRINTK=y
+
+          # NO PARAVIRT - This is the key setting!
+          CONFIG_PARAVIRT=n
+          CONFIG_PARAVIRT_XXL=n
+          CONFIG_PARAVIRT_SPINLOCKS=n
+          CONFIG_PARAVIRT_CLOCK=n
+          CONFIG_PARAVIRT_DEBUG=n
+
+          # NO KVM guest optimizations (uses paravirt)
+          CONFIG_KVM_GUEST=n
+          CONFIG_HYPERVISOR_GUEST=n
+
+          # Enable Hyper-V support for synthetic MSRs
+          CONFIG_HYPERV=n
+          CONFIG_HYPERV_TIMER=n
+
+          # Disable unnecessary virtualization features
+          CONFIG_XEN=n
+          CONFIG_KVM=n
+
+          # Basic memory support
+          CONFIG_FLATMEM=y
+          CONFIG_FLAT_NODE_MEM_MAP=y
+          CONFIG_SPARSEMEM_STATIC=n
+          CONFIG_MEMORY_HOTPLUG=n
+
+          # Disable ACPI (not needed for microvm)
+          CONFIG_ACPI=n
+
+          # Disable PCI (not needed for virtio-mmio)
+          CONFIG_PCI=n
+
+          # Basic timer support
+          CONFIG_HZ_100=y
+          CONFIG_HZ=100
+
+          # Disable modules (monolithic kernel)
+          CONFIG_MODULES=n
+
+          # Basic initramfs support
+          CONFIG_BLK_DEV_INITRD=y
+          CONFIG_INITRAMFS_SOURCE=""
+
+          # Minimal block device support
+          CONFIG_BLOCK=y
+          CONFIG_BLK_DEV=y
+          CONFIG_BLK_DEV_RAM=y
+          CONFIG_BLK_DEV_RAM_COUNT=1
+          CONFIG_BLK_DEV_RAM_SIZE=16384
+
+          # Basic filesystem support
+          CONFIG_FILE_LOCKING=y
+          CONFIG_PROC_FS=y
+          CONFIG_PROC_SYSCTL=y
+          CONFIG_SYSFS=y
+          CONFIG_DEVTMPFS=y
+          CONFIG_DEVTMPFS_MOUNT=y
+          CONFIG_TMPFS=y
+
+          # No networking (can add later)
+          CONFIG_NET=n
+
+          # Disable debugging features
+          CONFIG_DEBUG_KERNEL=n
+          CONFIG_DEBUG_INFO=n
+          CONFIG_KALLSYMS=n
+          CONFIG_FRAME_POINTER=n
+
+          # Disable loadable modules
+          CONFIG_MODULES=n
+          EOF
+
+          # Regenerate config to resolve dependencies
+          make olddefconfig
+
+      - name: Show final config (paravirt related)
+        run: |
+          cd linux
+          echo "=== PARAVIRT settings ==="
+          grep -E "PARAVIRT|HYPERV|KVM_GUEST|HYPERVISOR" .config || true
+
+      - name: Build kernel
+        run: |
+          cd linux
+          make -j$(nproc) bzImage
+          make -j$(nproc) vmlinux
+
+      - name: Create minimal initramfs with busybox
+        run: |
+          # Download and build static busybox
+          wget -q https://busybox.net/downloads/busybox-1.36.1.tar.bz2
+          tar xf busybox-1.36.1.tar.bz2
+          cd busybox-1.36.1
+          make defconfig
+          sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
+          make -j$(nproc)
+
+          # Create initramfs structure
+          mkdir -p ../initramfs/{bin,sbin,etc,proc,sys,dev,tmp}
+          cp busybox ../initramfs/bin/
+          cd ../initramfs/bin
+          for prog in sh ls cat echo mount mkdir; do
+            ln -s busybox $prog
+          done
+
+          # Create init script
+          cat > ../initramfs/init << 'INIT'
+          #!/bin/sh
+          mount -t proc none /proc
+          mount -t sysfs none /sys
+          mount -t devtmpfs none /dev
+          echo "==================================="
+          echo "  MicroVM Minimal Linux Booted!"
+          echo "==================================="
+          echo ""
+          cat /proc/version
+          echo ""
+          echo "Kernel command line:"
+          cat /proc/cmdline
+          echo ""
+          echo "Memory info:"
+          head -5 /proc/meminfo
+          echo ""
+          echo "Dropping to shell..."
+          exec /bin/sh
+          INIT
+          chmod +x ../initramfs/init
+
+          # Create initramfs cpio archive
+          cd ../initramfs
+          find . | cpio -o -H newc | gzip > ../initramfs-minimal.cpio.gz
+
+      - name: Package artifacts
+        run: |
+          mkdir -p artifacts
+          cp linux/arch/x86/boot/bzImage artifacts/bzImage-minimal
+          cp linux/vmlinux artifacts/vmlinux-minimal
+          cp initramfs-minimal.cpio.gz artifacts/
+
+          # Create info file
+          cat > artifacts/BUILD_INFO.txt << EOF
+          Minimal Linux Kernel for WHP (Windows Hypervisor Platform)
+
+          Built: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          Kernel Version: 6.1.90
+
+          Key Configuration:
+          - CONFIG_PARAVIRT=n (no paravirt - direct MSR access)
+          - CONFIG_KVM_GUEST=n (no KVM guest optimizations)
+          - CONFIG_HYPERVISOR_GUEST=n (no generic hypervisor)
+          - CONFIG_SERIAL_8250_CONSOLE=y (serial console)
+          - CONFIG_MODULES=n (monolithic kernel)
+
+          Files:
+          - bzImage-minimal: Compressed kernel for direct boot
+          - vmlinux-minimal: Uncompressed ELF kernel
+          - initramfs-minimal.cpio.gz: Minimal busybox initramfs
+
+          Usage with microvm:
+          microvm run --kernel bzImage-minimal --initrd initramfs-minimal.cpio.gz --memory 128 --cpus 1 --cmdline "console=ttyS0"
+          EOF
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: minimal-kernel-whp
+          path: artifacts/
+          retention-days: 90
+
+      - name: Create Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/bzImage-minimal
+            artifacts/vmlinux-minimal
+            artifacts/initramfs-minimal.cpio.gz
+            artifacts/BUILD_INFO.txt

@@ -23,13 +23,13 @@ pub enum VcpuExit {
     /// Execution was canceled
     Canceled,
     /// CPUID instruction
-    Cpuid { rax: u64, rcx: u64 },
+    Cpuid { rax: u64, rcx: u64, instruction_len: u8 },
     /// MSR read
-    MsrRead { msr: u32 },
+    MsrRead { msr: u32, instruction_len: u8 },
     /// MSR write
-    MsrWrite { msr: u32, value: u64 },
+    MsrWrite { msr: u32, value: u64, instruction_len: u8 },
     /// RDTSC instruction
-    Rdtsc,
+    Rdtsc { instruction_len: u8 },
     /// Unrecoverable exception (triple fault, etc.)
     Exception { exception_type: u8, error_code: u32, rip: u64 },
     /// Intercepted exception (from exception bitmap)
@@ -264,24 +264,63 @@ impl Vcpu {
                 }
                 WHV_RUN_VP_EXIT_REASON_X64_CPUID => {
                     let cpuid = exit_context.Anonymous.CpuidAccess;
+                    // Get instruction length from exit context
+                    let exec_state = exit_context.VpContext.ExecutionState.Anonymous._bitfield;
+                    let instruction_len = ((exec_state >> 4) & 0xF) as u8;
+                    // CPUID (0F A2) is always 2 bytes, force minimum of 2
+                    let instruction_len = if instruction_len < 2 { 2 } else { instruction_len };
                     Ok(VcpuExit::Cpuid {
                         rax: cpuid.Rax,
                         rcx: cpuid.Rcx,
+                        instruction_len,
                     })
                 }
                 WHV_RUN_VP_EXIT_REASON_X64_MSR_ACCESS => {
                     let msr_access = exit_context.Anonymous.MsrAccess;
 
+                    // Get instruction length from exit context (CRITICAL - don't hardcode!)
+                    let exec_state = exit_context.VpContext.ExecutionState.Anonymous._bitfield;
+                    let instruction_len = ((exec_state >> 4) & 0xF) as u8;
+                    // RDMSR (0F 32) and WRMSR (0F 30) are always 2 bytes
+                    // WHP may report incorrect lengths, so force minimum of 2
+                    let instruction_len = if instruction_len < 2 { 2 } else { instruction_len };
+
                     // AccessInfo bit 0: IsWrite
                     let access_info = msr_access.AccessInfo.Anonymous._bitfield;
                     let is_write = (access_info & 0x1) != 0;
 
-                    // Get MSR number from context and RCX
+                    // Get MSR number from context (this is the authoritative source per WHP docs)
                     let msr_from_context = msr_access.MsrNumber;
 
-                    // Read all relevant registers for debugging
-                    let (rcx, rip) = {
-                        let reg_names = [WHvX64RegisterRcx, WHvX64RegisterRip];
+                    // Read RCX as fallback - but DON'T read other registers unnecessarily
+                    // to avoid any potential side effects
+                    let rcx = {
+                        let reg_names = [WHvX64RegisterRcx];
+                        let mut reg_values = [WHV_REGISTER_VALUE::default(); 1];
+                        let _ = WHvGetVirtualProcessorRegisters(
+                            self.partition,
+                            self.index,
+                            reg_names.as_ptr(),
+                            1,
+                            reg_values.as_mut_ptr(),
+                        );
+                        reg_values[0].Reg64
+                    };
+
+                    // Determine MSR number - prefer context, fallback to RCX
+                    let msr = if msr_from_context != 0 {
+                        msr_from_context
+                    } else if rcx != 0 {
+                        rcx as u32
+                    } else {
+                        0 // Unknown MSR
+                    };
+
+                    // WHP BUG WORKAROUND: The exit context's Rax/Rdx fields may contain garbage
+                    // (often the MSR number instead of the actual value). We must read the
+                    // actual register values from the vCPU state.
+                    let (actual_rax, actual_rdx) = if is_write {
+                        let reg_names = [WHvX64RegisterRax, WHvX64RegisterRdx];
                         let mut reg_values = [WHV_REGISTER_VALUE::default(); 2];
                         let _ = WHvGetVirtualProcessorRegisters(
                             self.partition,
@@ -291,25 +330,32 @@ impl Vcpu {
                             reg_values.as_mut_ptr(),
                         );
                         (reg_values[0].Reg64, reg_values[1].Reg64)
-                    };
-
-                    // Debug disabled for now - was flooding output
-                    let _ = (msr_from_context, rip); // silence unused variable warnings
-
-                    // Use context MsrNumber if non-zero, otherwise use RCX
-                    let msr = if msr_from_context != 0 {
-                        msr_from_context
                     } else {
-                        rcx as u32
+                        (0, 0)
                     };
+
+                    // Debug: Print MSR access info (limit output)
+                    static DEBUG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                    let count = DEBUG_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if count < 20 {
+                        let rip = exit_context.VpContext.Rip;
+                        if is_write {
+                            eprintln!("[MSR] 0x{:x} WRITE msr=0x{:x} (RCX=0x{:x}, RAX=0x{:x}, RDX=0x{:x}, len={})",
+                                rip, msr, rcx, actual_rax, actual_rdx, instruction_len);
+                        } else {
+                            eprintln!("[MSR] 0x{:x} READ msr=0x{:x} (RCX=0x{:x}, len={})",
+                                rip, msr, rcx, instruction_len);
+                        }
+                    }
 
                     if is_write {
                         Ok(VcpuExit::MsrWrite {
                             msr,
-                            value: msr_access.Rax | (msr_access.Rdx << 32)
+                            value: actual_rax | (actual_rdx << 32),
+                            instruction_len,
                         })
                     } else {
-                        Ok(VcpuExit::MsrRead { msr })
+                        Ok(VcpuExit::MsrRead { msr, instruction_len })
                     }
                 }
                 WHV_RUN_VP_EXIT_REASON_CANCELED => Ok(VcpuExit::Canceled),
@@ -331,7 +377,11 @@ impl Vcpu {
                     Ok(VcpuExit::Exception { exception_type, error_code, rip })
                 }
                 WHV_RUN_VP_EXIT_REASON_X64_RDTSC => {
-                    Ok(VcpuExit::Rdtsc)
+                    let exec_state = exit_context.VpContext.ExecutionState.Anonymous._bitfield;
+                    let instruction_len = ((exec_state >> 4) & 0xF) as u8;
+                    // RDTSC (0F 31) is always 2 bytes, force minimum of 2
+                    let instruction_len = if instruction_len < 2 { 2 } else { instruction_len };
+                    Ok(VcpuExit::Rdtsc { instruction_len })
                 }
                 other => Ok(VcpuExit::Unknown(other)),
             }
@@ -414,6 +464,128 @@ impl Vcpu {
         Ok(())
     }
 
+    /// Read a segment register (FS or GS) base address.
+    #[cfg(target_os = "windows")]
+    pub fn read_segment_base(&self, reg: WHV_REGISTER_NAME) -> Result<u64> {
+        unsafe {
+            let reg_names = [reg];
+            let mut reg_values = [WHV_REGISTER_VALUE::default()];
+
+            WHvGetVirtualProcessorRegisters(
+                self.partition,
+                self.index,
+                reg_names.as_ptr(),
+                1,
+                reg_values.as_mut_ptr(),
+            )
+            .map_err(|e| Error::VcpuError(format!("Failed to read segment register: {:?}", e)))?;
+
+            Ok(reg_values[0].Segment.Base)
+        }
+    }
+
+    /// Write a segment register base only (preserve other fields).
+    #[cfg(target_os = "windows")]
+    pub fn write_segment_base(&self, reg: WHV_REGISTER_NAME, base: u64) -> Result<()> {
+        unsafe {
+            // First read the current segment value
+            let reg_names = [reg];
+            let mut reg_values = [WHV_REGISTER_VALUE::default()];
+
+            WHvGetVirtualProcessorRegisters(
+                self.partition,
+                self.index,
+                reg_names.as_ptr(),
+                1,
+                reg_values.as_mut_ptr(),
+            )
+            .map_err(|e| Error::VcpuError(format!("Failed to read segment for base update: {:?}", e)))?;
+
+            // Modify only the base
+            reg_values[0].Segment.Base = base;
+
+            // Write it back
+            WHvSetVirtualProcessorRegisters(
+                self.partition,
+                self.index,
+                reg_names.as_ptr(),
+                1,
+                reg_values.as_ptr(),
+            )
+            .map_err(|e| Error::VcpuError(format!("Failed to write segment base: {:?}", e)))?;
+
+            Ok(())
+        }
+    }
+
+    /// Handle MSR write for special MSRs that map to WHP registers.
+    /// Returns true if the MSR was handled, false otherwise.
+    #[cfg(target_os = "windows")]
+    pub fn handle_msr_write(&self, msr: u32, value: u64) -> Result<bool> {
+        // Map special MSRs to WHP register equivalents
+        // These MUST be handled via WHvSetVirtualProcessorRegisters, not emulated
+        match msr {
+            0xC0000100 => {
+                // IA32_FS_BASE -> Update FS segment's base field
+                self.write_segment_base(WHvX64RegisterFs, value)?;
+                Ok(true)
+            }
+            0xC0000101 => {
+                // IA32_GS_BASE -> Update GS segment's base field
+                self.write_segment_base(WHvX64RegisterGs, value)?;
+                Ok(true)
+            }
+            0xC0000102 => {
+                // IA32_KERNEL_GS_BASE -> WHvX64RegisterKernelGsBase
+                self.write_register(WHvX64RegisterKernelGsBase, value)?;
+                Ok(true)
+            }
+            0xC0000080 => {
+                // IA32_EFER -> WHvX64RegisterEfer
+                self.write_register(WHvX64RegisterEfer, value)?;
+                Ok(true)
+            }
+            0xC0000081 => {
+                // IA32_STAR -> WHvX64RegisterStar
+                self.write_register(WHvX64RegisterStar, value)?;
+                Ok(true)
+            }
+            0xC0000082 => {
+                // IA32_LSTAR -> WHvX64RegisterLstar
+                self.write_register(WHvX64RegisterLstar, value)?;
+                Ok(true)
+            }
+            0xC0000083 => {
+                // IA32_CSTAR -> WHvX64RegisterCstar
+                self.write_register(WHvX64RegisterCstar, value)?;
+                Ok(true)
+            }
+            0xC0000084 => {
+                // IA32_FMASK -> WHvX64RegisterSfmask
+                self.write_register(WHvX64RegisterSfmask, value)?;
+                Ok(true)
+            }
+            _ => Ok(false), // Not a special MSR
+        }
+    }
+
+    /// Handle MSR read for special MSRs that map to WHP registers.
+    /// Returns Some(value) if the MSR was handled, None otherwise.
+    #[cfg(target_os = "windows")]
+    pub fn handle_msr_read(&self, msr: u32) -> Result<Option<u64>> {
+        match msr {
+            0xC0000100 => Ok(Some(self.read_segment_base(WHvX64RegisterFs)?)),
+            0xC0000101 => Ok(Some(self.read_segment_base(WHvX64RegisterGs)?)),
+            0xC0000102 => Ok(Some(self.read_register(WHvX64RegisterKernelGsBase)?)),
+            0xC0000080 => Ok(Some(self.read_register(WHvX64RegisterEfer)?)),
+            0xC0000081 => Ok(Some(self.read_register(WHvX64RegisterStar)?)),
+            0xC0000082 => Ok(Some(self.read_register(WHvX64RegisterLstar)?)),
+            0xC0000083 => Ok(Some(self.read_register(WHvX64RegisterCstar)?)),
+            0xC0000084 => Ok(Some(self.read_register(WHvX64RegisterSfmask)?)),
+            _ => Ok(None),
+        }
+    }
+
     /// Advance RIP by the given amount (used after handling exits).
     #[cfg(target_os = "windows")]
     pub fn advance_rip(&self, bytes: u64) -> Result<()> {
@@ -474,6 +646,26 @@ impl Vcpu {
 
     #[cfg(not(target_os = "windows"))]
     pub fn write_table_register(&self, _reg: u32, _base: u64, _limit: u16) -> Result<()> {
+        Err(Error::HypervisorNotAvailable)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    pub fn read_segment_base(&self, _reg: u32) -> Result<u64> {
+        Err(Error::HypervisorNotAvailable)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    pub fn write_segment_base(&self, _reg: u32, _base: u64) -> Result<()> {
+        Err(Error::HypervisorNotAvailable)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    pub fn handle_msr_write(&self, _msr: u32, _value: u64) -> Result<bool> {
+        Err(Error::HypervisorNotAvailable)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    pub fn handle_msr_read(&self, _msr: u32) -> Result<Option<u64>> {
         Err(Error::HypervisorNotAvailable)
     }
 }

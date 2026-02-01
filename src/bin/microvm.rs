@@ -1493,33 +1493,40 @@ fn run_vm_loop(
         // - Ignore all MSR writes
         // This follows QEMU's WHPX approach and allows the kernel to make progress.
         match &exit {
-            VcpuExit::MsrRead { msr } if *msr == 0 => {
-                // WHP bug: MSR number is 0 - just return 0 and advance
+            VcpuExit::MsrRead { msr, instruction_len } if *msr == 0 => {
+                // WHP bug: MSR number is 0 - return incrementing value to break timing loops
                 static MSR_READ_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                static MSR_VALUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let count = MSR_READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Simulate TSC-like behavior - increment by ~10000 "cycles" per read
+                // This helps the kernel timing loops make progress
+                let value = MSR_VALUE.fetch_add(10000, std::sync::atomic::Ordering::SeqCst);
+                let len = *instruction_len;
+
                 if count < 3 {
                     let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
                     let rip = vcpu.read_register(WHvX64RegisterRip).unwrap_or(0);
-                    eprintln!("[MSR READ] RIP=0x{:x} (MSR unknown due to WHP bug, returning 0)", rip);
+                    eprintln!("[MSR READ] RIP=0x{:x} (MSR unknown, returning incrementing value 0x{:x}, len={})", rip, value, len);
                 }
 
                 let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
-                vcpu.set_msr_result(0)?;
-                vcpu.advance_rip(2)?;
+                vcpu.set_msr_result(value)?;
+                vcpu.advance_rip(len as u64)?;
                 continue;
             }
-            VcpuExit::MsrWrite { msr, value } if *msr == 0 => {
+            VcpuExit::MsrWrite { msr, value, instruction_len } if *msr == 0 => {
                 // WHP bug: MSR number is 0 - just ignore the write and advance
                 static MSR_WRITE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                 let count = MSR_WRITE_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let len = *instruction_len;
                 if count < 3 {
                     let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
                     let rip = vcpu.read_register(WHvX64RegisterRip).unwrap_or(0);
-                    eprintln!("[MSR WRITE] RIP=0x{:x}, value=0x{:x} (MSR unknown, ignoring)", rip, value);
+                    eprintln!("[MSR WRITE] RIP=0x{:x}, value=0x{:x} (MSR unknown, ignoring, len={})", rip, value, len);
                 }
 
                 let vcpu = vm.vcpu_mut(0).ok_or("No vCPU")?;
-                vcpu.advance_rip(2)?;
+                vcpu.advance_rip(len as u64)?;
                 continue;
             }
             _ => {}
@@ -1608,11 +1615,23 @@ fn run_vm_loop(
                 // Advance RIP past the IN instruction
                 vcpu.advance_rip(instruction_len as u64)?;
             }
-            VcpuExit::Cpuid { rax, rcx } => {
+            VcpuExit::Cpuid { rax, rcx, instruction_len } => {
                 // Handle CPUID instruction
                 let (eax, ebx, ecx, edx) = handle_cpuid(rax as u32, rcx as u32);
+                // Log important CPUID queries
+                static CPUID_LOG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let count = CPUID_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if count < 30 {
+                    if rax >= 0x40000000 && rax <= 0x400000FF {
+                        eprintln!("[CPUID] Hyper-V leaf 0x{:x} -> EAX=0x{:x} EBX=0x{:x}", rax, eax, ebx);
+                    } else if rax == 1 {
+                        eprintln!("[CPUID] Leaf 1 -> ECX=0x{:x} (hypervisor={})", ecx, (ecx >> 31) & 1);
+                    } else if rax == 0 {
+                        eprintln!("[CPUID] Leaf 0 -> max_leaf=0x{:x}", eax);
+                    }
+                }
                 vcpu.set_cpuid_result(eax, ebx, ecx, edx)?;
-                vcpu.advance_rip(2)?; // CPUID is 2 bytes (0x0F 0xA2)
+                vcpu.advance_rip(instruction_len as u64)?;
             }
             VcpuExit::MmioRead { addr, size: _ } => {
                 eprintln!("MMIO read at 0x{:x}", addr);
@@ -1632,27 +1651,65 @@ fn run_vm_loop(
                 println!("\nVM execution canceled");
                 break;
             }
-            VcpuExit::MsrRead { msr } => {
+            VcpuExit::MsrRead { msr, instruction_len } => {
                 // msr==0 case is handled above before the main match
                 // This handles the case where WHP properly reported the MSR number
-                let value = handle_msr_read(msr);
-                vcpu.set_msr_result(value)?;
-                vcpu.advance_rip(2)?; // RDMSR is 2 bytes (0x0F 0x32)
+
+                // First try special MSRs that map to WHP registers (FS_BASE, GS_BASE, etc.)
+                if let Ok(Some(value)) = vcpu.handle_msr_read(msr) {
+                    // Log reads of important MSRs
+                    if msr >= 0xC0000100 && msr <= 0xC0000102 {
+                        static MSR_LOG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                        if MSR_LOG.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 20 {
+                            eprintln!("[MSR READ] 0x{:x} ({}) -> 0x{:x}",
+                                msr,
+                                match msr { 0xC0000100 => "FS_BASE", 0xC0000101 => "GS_BASE", 0xC0000102 => "KERNEL_GS_BASE", _ => "?" },
+                                value);
+                        }
+                    }
+                    vcpu.set_msr_result(value)?;
+                } else {
+                    // Fall back to software emulation
+                    let value = handle_msr_read(msr);
+                    vcpu.set_msr_result(value)?;
+                }
+                vcpu.advance_rip(instruction_len as u64)?;
             }
-            VcpuExit::MsrWrite { msr, value } => {
+            VcpuExit::MsrWrite { msr, value, instruction_len } => {
                 // msr==0 case is handled above before the main match
                 // This handles the case where WHP properly reported the MSR number
-                handle_msr_write(msr, value);
-                vcpu.advance_rip(2)?; // WRMSR is 2 bytes (0x0F 0x30)
+
+                // Log writes to important MSRs
+                if msr >= 0xC0000100 && msr <= 0xC0000102 {
+                    static MSR_LOG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                    if MSR_LOG.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 20 {
+                        eprintln!("[MSR WRITE] 0x{:x} ({}) <- 0x{:x}",
+                            msr,
+                            match msr { 0xC0000100 => "FS_BASE", 0xC0000101 => "GS_BASE", 0xC0000102 => "KERNEL_GS_BASE", _ => "?" },
+                            value);
+                    }
+                }
+
+                // First try special MSRs that map to WHP registers (FS_BASE, GS_BASE, etc.)
+                if let Ok(handled) = vcpu.handle_msr_write(msr, value) {
+                    if !handled {
+                        // Fall back to software emulation
+                        handle_msr_write(msr, value);
+                    }
+                } else {
+                    // Error in handle_msr_write, fall back
+                    handle_msr_write(msr, value);
+                }
+                vcpu.advance_rip(instruction_len as u64)?;
             }
-            VcpuExit::Rdtsc => {
+            VcpuExit::Rdtsc { instruction_len } => {
                 // Return an increasing TSC value to simulate time passing
                 static TSC_VALUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let tsc = TSC_VALUE.fetch_add(1_000_000, std::sync::atomic::Ordering::SeqCst);
                 // RDTSC returns result in EDX:EAX
                 vcpu.write_register(WHvX64RegisterRax, tsc & 0xFFFFFFFF)?;
                 vcpu.write_register(WHvX64RegisterRdx, tsc >> 32)?;
-                vcpu.advance_rip(2)?; // RDTSC is 2 bytes (0x0F 0x31)
+                vcpu.advance_rip(instruction_len as u64)?;
             }
             VcpuExit::Exception { exception_type, error_code, rip } => {
                 // x86 exception types:
@@ -1745,11 +1802,81 @@ fn run_vm_loop(
 /// Handle MSR read for WHP.
 #[cfg(target_os = "windows")]
 fn handle_msr_read(msr: u32) -> u64 {
-    // Use a static counter to simulate time passing for MSR 0 reads
-    // The kernel might be in a delay loop polling an MSR
+    // Counters for time-sensitive MSRs
     static MSR0_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static TIME_REF_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static VP_RUNTIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     match msr {
+        // ============================================================
+        // Hyper-V Synthetic MSRs (0x40000xxx)
+        // These are properly handled because we KNOW their numbers!
+        // ============================================================
+
+        // HV_X64_MSR_GUEST_OS_ID (0x40000000) - Guest OS identification
+        0x40000000 => 0,
+
+        // HV_X64_MSR_HYPERCALL (0x40000001) - Hypercall page MSR
+        // Return 0 to indicate hypercall page is not enabled
+        0x40000001 => 0,
+
+        // HV_X64_MSR_VP_INDEX (0x40000002) - Virtual processor index
+        // Return 0 for the first (and only) vCPU
+        0x40000002 => 0,
+
+        // HV_X64_MSR_RESET (0x40000003) - System reset MSR
+        0x40000003 => 0,
+
+        // HV_X64_MSR_VP_RUNTIME (0x40000010) - VP runtime in 100ns units
+        // Return an increasing value to simulate time passing
+        0x40000010 => {
+            VP_RUNTIME.fetch_add(10000, std::sync::atomic::Ordering::SeqCst)
+        }
+
+        // HV_X64_MSR_TIME_REF_COUNT (0x40000020) - Reference time counter
+        // Returns time in 100ns units since VM start - CRITICAL for timing!
+        0x40000020 => {
+            TIME_REF_COUNT.fetch_add(100000, std::sync::atomic::Ordering::SeqCst)
+        }
+
+        // HV_X64_MSR_REFERENCE_TSC (0x40000021) - Reference TSC page
+        // Return 0 to indicate TSC page is not set up (kernel will use MSR instead)
+        0x40000021 => 0,
+
+        // HV_X64_MSR_APIC_FREQUENCY (0x40000023) - APIC frequency in Hz
+        // Report 1GHz APIC frequency
+        0x40000023 => 1000000000,
+
+        // HV_X64_MSR_TSC_FREQUENCY (0x40000022) - TSC frequency in Hz
+        // Report 2GHz TSC frequency
+        0x40000022 => 2000000000,
+
+        // HV_X64_MSR_SCONTROL (0x40000080) - SynIC control
+        0x40000080 => 0,
+
+        // HV_X64_MSR_SIEFP (0x40000082) - SynIC event flags page
+        0x40000082 => 0,
+
+        // HV_X64_MSR_SIMP (0x40000083) - SynIC message page
+        0x40000083 => 0,
+
+        // HV_X64_MSR_EOM (0x40000084) - End of message
+        0x40000084 => 0,
+
+        // HV_X64_MSR_SINT0-SINT15 (0x40000090-0x4000009F) - Synthetic interrupt sources
+        0x40000090..=0x4000009F => 0,
+
+        // HV_X64_MSR_STIMER0_CONFIG - STIMER3_COUNT (0x400000B0-0x400000B7)
+        // Synthetic timer MSRs
+        0x400000B0..=0x400000B7 => 0,
+
+        // HV_X64_MSR_CRASH_P0-P4, CRASH_CTL (0x40000100-0x40000105)
+        0x40000100..=0x40000105 => 0,
+
+        // ============================================================
+        // Standard x86 MSRs (fallback, but synthetic MSRs are preferred)
+        // ============================================================
+
         // IA32_P5_MC_ADDR / probing MSR - or unknown MSR being probed
         // Return an increasing value to simulate time passing
         0x0 => {
@@ -1786,10 +1913,54 @@ fn handle_msr_read(msr: u32) -> u64 {
 
 /// Handle MSR write for WHP.
 #[cfg(target_os = "windows")]
-fn handle_msr_write(msr: u32, _value: u64) {
-    // Silently ignore all MSR writes for now
-    // The kernel will write to various MSRs during boot
+fn handle_msr_write(msr: u32, value: u64) {
+    // Track writes to important MSRs (for debugging)
+    static GUEST_OS_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     match msr {
+        // ============================================================
+        // Hyper-V Synthetic MSRs (0x40000xxx)
+        // Accept writes to these - kernel sets them during init
+        // ============================================================
+
+        // HV_X64_MSR_GUEST_OS_ID - Guest registers its OS type
+        0x40000000 => {
+            GUEST_OS_ID.store(value, std::sync::atomic::Ordering::SeqCst);
+            // Log this as it indicates the guest detected Hyper-V!
+            eprintln!("[Hyper-V] Guest OS ID set to 0x{:x}", value);
+        }
+
+        // HV_X64_MSR_HYPERCALL - Guest sets up hypercall page
+        0x40000001 => {
+            // We don't support hypercalls, but accept the write
+            if value != 0 {
+                eprintln!("[Hyper-V] Hypercall page setup: 0x{:x} (ignored)", value);
+            }
+        }
+
+        // HV_X64_MSR_VP_INDEX - read-only, but accept writes silently
+        0x40000002 => {}
+
+        // HV_X64_MSR_RESET - system reset request
+        0x40000003 => {
+            eprintln!("[Hyper-V] Reset requested via MSR");
+        }
+
+        // HV_X64_MSR_REFERENCE_TSC - TSC page setup
+        0x40000021 => {}
+
+        // SynIC MSRs - accept but don't implement
+        0x40000080..=0x400000B7 => {}
+
+        // Crash MSRs - log crash info
+        0x40000100..=0x40000105 => {
+            eprintln!("[Hyper-V] Crash MSR 0x{:x} = 0x{:x}", msr, value);
+        }
+
+        // ============================================================
+        // Standard x86 MSRs
+        // ============================================================
+
         0x0 | 0xC0000080 | 0xC0000100 | 0xC0000101 | 0xC0000102 => {}
         0xC0000081 | 0xC0000082 | 0xC0000083 | 0xC0000084 | 0x1B => {}
         _ => {}
@@ -1810,8 +1981,9 @@ fn handle_cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
             // Processor info and features
             let eax = 0x000506E3; // Family 6, Model 94 (Skylake-like)
             let ebx = 0x00100800; // CLFLUSH=8, APIC ID=0, 1 logical processor
-            // ECX features: SSE3, PCLMULQDQ, SSSE3, SSE4.1, SSE4.2, POPCNT, AES, XSAVE, OSXSAVE, AVX
-            let ecx = 0x00000201; // SSE3, minimal features
+            // ECX features: SSE3 + HYPERVISOR bit (bit 31)
+            // Bit 31 (0x80000000) = Hypervisor present - tells guest it's in a VM
+            let ecx = 0x80000201; // SSE3 + Hypervisor present
             // EDX features: FPU, VME, DE, PSE, TSC, MSR, PAE, MCE, CX8, APIC, SEP, MTRR, PGE, MCA, CMOV, PAT, PSE36, CLFSH, MMX, FXSR, SSE, SSE2
             let edx = 0x178BFBFF;
             (eax, ebx, ecx, edx)
@@ -1867,6 +2039,99 @@ fn handle_cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
             // EAX: bits 7:0 = physical address bits (48), bits 15:8 = virtual address bits (48)
             (0x00003030, 0, 0, 0)
         }
+
+        // ============================================================
+        // Hyper-V Enlightenment CPUID leaves (0x40000000 - 0x4000000A)
+        // These make Linux detect Hyper-V and use synthetic MSRs
+        // instead of standard MSRs that WHP can't properly report.
+        // ============================================================
+
+        0x40000000 => {
+            // Hypervisor CPUID leaf range and vendor signature
+            // EAX = Maximum hypervisor CPUID leaf
+            // EBX:ECX:EDX = "Microsoft Hv" signature
+            let eax = 0x40000006; // Max leaf we support
+            let ebx = 0x7263694D; // "Micr"
+            let ecx = 0x666F736F; // "osof"
+            let edx = 0x76482074; // "t Hv"
+            (eax, ebx, ecx, edx)
+        }
+        0x40000001 => {
+            // Hypervisor vendor-neutral interface identification
+            // EAX = "Hv#1" interface signature
+            (0x31237648, 0, 0, 0) // "Hv#1"
+        }
+        0x40000002 => {
+            // Hypervisor system identity (build number, version)
+            // We report as a recent Hyper-V build
+            let eax = 0x00003FFE; // Build number
+            let ebx = 0x000A0000; // Major.Minor version (10.0)
+            let ecx = 0;          // Service pack
+            let edx = 0;          // Service branch
+            (eax, ebx, ecx, edx)
+        }
+        0x40000003 => {
+            // Hypervisor feature identification
+            // EAX = Partition privileges (what MSRs/features guest can use)
+            // EBX = Flags
+            // ECX = Power management features
+            // EDX = Misc features
+
+            // Privileges (EAX):
+            // Bit 0: AccessVpRunTimeReg - HV_X64_MSR_VP_RUNTIME
+            // Bit 1: AccessPartitionReferenceCounter - HV_X64_MSR_TIME_REF_COUNT
+            // Bit 2: AccessSynicRegs - Synthetic interrupt controller MSRs
+            // Bit 3: AccessSyntheticTimerRegs - Synthetic timer MSRs
+            // Bit 4: AccessIntrCtrlRegs - APIC MSRs
+            // Bit 5: AccessHypercallMsrs - Hypercall MSRs
+            // Bit 6: AccessVpIndex - HV_X64_MSR_VP_INDEX
+            // Bit 9: AccessPartitionReferenceTsc - Reference TSC page
+            let eax = 0x00000263; // VP_RUNTIME, TIME_REF_COUNT, VP_INDEX, AccessPartitionReferenceTsc, AccessHypercallMsrs
+
+            // Flags (EBX):
+            // Bit 0: CreatePartitions
+            // Bit 1: AccessPartitionId
+            // Bit 2: AccessMemoryPool
+            // Bit 4: PostMessages
+            // Bit 5: SignalEvents
+            let ebx = 0x00000000;
+
+            let ecx = 0; // Power management (none)
+            let edx = 0; // Misc features
+            (eax, ebx, ecx, edx)
+        }
+        0x40000004 => {
+            // Implementation recommendations
+            // EAX = Recommendations for optimal performance
+            // Bit 0: Hypercall for address space switches (not TLB flush)
+            // Bit 1: Hypercall for local TLB flushes
+            // Bit 2: Hypercall for remote TLB flushes
+            // Bit 3: MSRs for APIC access (EOI, ICR, TPR)
+            // Bit 4: MSR for system RESET
+            // Bit 5: Relaxed timing - don't need strict timers
+            // Bit 6: Use DMA remapping
+            // Bit 7: Use interrupt remapping
+            // Bit 8: Use x2APIC MSRs
+            // Bit 12: Use hypercall for APIC EOI
+            let eax = 0x00000020; // Relaxed timing (bit 5) - key for MSR workaround!
+            let ebx = 0;
+            let ecx = 0;
+            let edx = 0;
+            (eax, ebx, ecx, edx)
+        }
+        0x40000005 => {
+            // Hypervisor implementation limits
+            // EAX = Max virtual processors
+            // EBX = Max logical processors
+            // ECX = Max physical interrupt vectors for remapping
+            (64, 64, 0, 0)
+        }
+        0x40000006 => {
+            // Hypervisor hardware features exposed
+            // EAX = Hardware features
+            (0, 0, 0, 0)
+        }
+
         _ => (0, 0, 0, 0),
     }
 }

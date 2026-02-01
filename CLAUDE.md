@@ -83,6 +83,10 @@ SSH Client → vsock (SOCKS5) → microvm → OpenVPN → Target
 - [x] WHP I/O port emulation (serial, PIT, PCI config)
 - [x] WHP CPUID emulation
 - [x] WHP APIC emulation configuration
+- [x] WHP MSR->Register mapping (FS_BASE, GS_BASE, KERNEL_GS_BASE, EFER, STAR, LSTAR, CSTAR, SFMASK)
+- [x] Fixed WHP exit context bug (RAX/RDX corruption in MSR exits)
+- [x] Fixed instruction length handling for MSR/CPUID/RDTSC exits
+- [x] Linux kernel boots to 64-bit mode and sets up per-CPU data
 
 ### Known Limitations
 
@@ -94,12 +98,22 @@ WHP has a significant limitation where MSR exits don't properly report the MSR n
 - Tried instruction decoding (looking for `mov ecx, imm32` patterns before RDMSR/WRMSR) - kernel uses indirect MSR access via paravirt
 - Tried reading MSR number from memory via RDX register (for `mov ecx, [rdx]` patterns) - the memory locations are uninitialized (contain 0)
 - QEMU's WHPX backend has the same issue and just returns 0 for all RDMSR and ignores all WRMSR
+- **NEW FINDING**: WHP also corrupts RAX/RDX values in the MSR exit context - must read actual registers
+- **NEW FINDING**: WHP reports wrong instruction lengths (e.g., 1 instead of 2 for RDMSR/WRMSR)
+- **PARTIAL SUCCESS**: When RCX contains the MSR number (non-paravirt access), we can detect and handle it correctly
+- **PARTIAL SUCCESS**: Mapped special MSRs (FS_BASE, GS_BASE, KERNEL_GS_BASE, EFER, etc.) to WHP register equivalents
 
-**Impact:** Standard Linux kernels cannot boot because they rely on MSRs for:
+**Current State:**
+- Kernel boots into 64-bit long mode
+- GS_BASE/FS_BASE MSRs are handled correctly when accessible
+- Kernel crashes during timer calibration (Divide Error #DE)
+- Unknown MSRs (msr=0x0 due to paravirt) still cannot be identified
+
+**Impact:** Standard Linux kernels cannot fully boot because they rely on MSRs for:
 - CPU feature detection
 - APIC configuration
-- Timer calibration (TSC, kvmclock)
-- Paravirt operations
+- Timer calibration (TSC, kvmclock) - **causes Divide Error**
+- Paravirt operations - **cannot detect MSR number**
 
 **Workaround options:**
 1. Use a custom-built minimal kernel that avoids paravirt MSR patterns

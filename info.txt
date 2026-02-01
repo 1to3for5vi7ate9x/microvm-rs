@@ -14,8 +14,31 @@
   # Test hello_vm example (this DOES work)
   cargo run --example hello_vm
 
-  The hello_vm example works and prints "Hi!" - basic WHP execution is fine. The issue is 
-  specifically with booting a full Linux kernel due to the MSR handling limitations. 
+  The hello_vm example works and prints "Hi!" - basic WHP execution is fine. The issue is
+  specifically with booting a full Linux kernel due to the MSR handling limitations.
+
+  Current Status (Updated 2026-02-02):
+  ====================================
+
+  PROGRESS MADE:
+  1. Fixed instruction length handling - WHP was reporting wrong lengths for MSR/CPUID/RDTSC
+  2. Fixed WHP exit context bug - WHP was corrupting RAX/RDX values in exit context
+     - Now reading actual register values from vCPU state
+  3. Implemented proper MSR->WHP register mapping for:
+     - FS_BASE (0xC0000100) -> Segment register base
+     - GS_BASE (0xC0000101) -> Segment register base
+     - KERNEL_GS_BASE (0xC0000102) -> WHvX64RegisterKernelGsBase
+     - EFER, STAR, LSTAR, CSTAR, SFMASK -> WHP registers
+  4. Linux kernel now boots into 64-bit mode and sets up per-CPU data
+
+  REMAINING ISSUE:
+  - Kernel hits Divide Error (#DE) during timer calibration
+  - Caused by unknown MSRs (msr=0x0) returning fake values
+  - Timer MSRs not being properly emulated due to WHP MSR bug
+
+  SOLUTION NEEDED:
+  - Build custom kernel with CONFIG_PARAVIRT=n to avoid indirect MSR access
+  - GitHub Actions workflow created: .github/workflows/build-kernel.yml 
 
 
 --------------------------------------------------------------------------------------------------
