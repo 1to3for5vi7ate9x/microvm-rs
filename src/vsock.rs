@@ -287,6 +287,96 @@ pub fn create_vsock_channel(guest_cid: u64) -> (VsockClient, VsockHandler) {
     (client, handler)
 }
 
+/// TCP-based vsock bridge for the WSL2 backend on Windows.
+///
+/// Maps VsockMessage operations to TCP connections on localhost.
+/// WSL2 shares the host network namespace, so guest services are reachable
+/// at `127.0.0.1:<port>`.
+#[cfg(target_os = "windows")]
+pub struct TcpVsockBridge {
+    /// Active TCP connections: (local_port, guest_port) -> TcpStream
+    connections: HashMap<(u32, u32), std::net::TcpStream>,
+}
+
+#[cfg(target_os = "windows")]
+impl TcpVsockBridge {
+    /// Create a new TCP vsock bridge.
+    pub fn new() -> Self {
+        Self {
+            connections: HashMap::new(),
+        }
+    }
+
+    /// Process a VsockMessage by mapping it to TCP operations.
+    pub fn handle_message(&mut self, msg: VsockMessage) {
+        match msg {
+            VsockMessage::Connect { guest_port, response } => {
+                let addr = format!("127.0.0.1:{}", guest_port);
+                match std::net::TcpStream::connect_timeout(
+                    &addr.parse().unwrap(),
+                    std::time::Duration::from_secs(5),
+                ) {
+                    Ok(stream) => {
+                        stream.set_nonblocking(true).ok();
+                        let local_port = stream.local_addr()
+                            .map(|a| a.port() as u32)
+                            .unwrap_or(guest_port);
+                        self.connections.insert((local_port, guest_port), stream);
+                        let _ = response.send(Ok(local_port));
+                    }
+                    Err(e) => {
+                        let _ = response.send(Err(format!("TCP connect failed: {}", e)));
+                    }
+                }
+            }
+            VsockMessage::Send { local_port, guest_port, data, response } => {
+                use std::io::Write;
+                let key = (local_port, guest_port);
+                if let Some(stream) = self.connections.get_mut(&key) {
+                    match stream.write_all(&data) {
+                        Ok(()) => {
+                            let _ = response.send(Ok(data.len()));
+                        }
+                        Err(e) => {
+                            let _ = response.send(Err(format!("TCP write failed: {}", e)));
+                        }
+                    }
+                } else {
+                    let _ = response.send(Err("Connection not found".into()));
+                }
+            }
+            VsockMessage::Recv { local_port, guest_port, response } => {
+                use std::io::Read;
+                let key = (local_port, guest_port);
+                if let Some(stream) = self.connections.get_mut(&key) {
+                    let mut buf = vec![0u8; 4096];
+                    match stream.read(&mut buf) {
+                        Ok(0) => {
+                            let _ = response.send(Ok(Vec::new()));
+                        }
+                        Ok(n) => {
+                            buf.truncate(n);
+                            let _ = response.send(Ok(buf));
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            let _ = response.send(Ok(Vec::new()));
+                        }
+                        Err(e) => {
+                            let _ = response.send(Err(format!("TCP read failed: {}", e)));
+                        }
+                    }
+                } else {
+                    let _ = response.send(Err("Connection not found".into()));
+                }
+            }
+            VsockMessage::Close { local_port, guest_port } => {
+                let key = (local_port, guest_port);
+                self.connections.remove(&key);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -12,7 +12,7 @@ use crate::error::Result;
 pub mod hvf;
 
 #[cfg(target_os = "windows")]
-pub mod whp;
+pub mod wsl;
 
 #[cfg(target_os = "linux")]
 pub mod kvm;
@@ -53,7 +53,7 @@ pub trait HypervisorBackend: Send {
     /// Force kill the VM immediately.
     fn kill(&mut self) -> Result<()>;
 
-    /// Get the backend name (e.g., "hvf", "whp", "kvm").
+    /// Get the backend name (e.g., "hvf", "wsl2", "kvm").
     fn name(&self) -> &'static str;
 }
 
@@ -66,7 +66,7 @@ pub fn is_available() -> bool {
 
     #[cfg(target_os = "windows")]
     {
-        whp::is_available()
+        wsl::is_available()
     }
 
     #[cfg(target_os = "linux")]
@@ -89,7 +89,7 @@ pub fn name() -> Option<&'static str> {
 
     #[cfg(target_os = "windows")]
     {
-        Some("whp")
+        Some("wsl2")
     }
 
     #[cfg(target_os = "linux")]
@@ -112,7 +112,7 @@ pub fn create(config: VmConfig) -> Result<Box<dyn HypervisorBackend>> {
 
     #[cfg(target_os = "windows")]
     {
-        whp::WhpBackend::new(config).map(|b| Box::new(b) as Box<dyn HypervisorBackend>)
+        wsl::WslBackend::new(config).map(|b| Box::new(b) as Box<dyn HypervisorBackend>)
     }
 
     #[cfg(target_os = "linux")]

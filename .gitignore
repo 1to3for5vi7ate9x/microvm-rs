@@ -36,6 +36,9 @@ guest/*.c
 guest/*_test
 guest/*/target/
 
+# WSL rootfs - track the tarball and scripts
+!guest/wsl-rootfs/
+
 # Linux kernel source
 linux-*.tar.xz
 linux-*/
@@ -54,3 +57,4 @@ initramfs/
 *.profraw
 *.profdata
 coverage/
+vm/

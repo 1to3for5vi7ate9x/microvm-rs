@@ -28,9 +28,8 @@ fn main() {
 
         #[cfg(target_os = "windows")]
         {
-            println!("  - Hyper-V is not enabled");
-            println!("  - Windows version is too old (need 1803+)");
-            println!("  - Virtualization not enabled in BIOS");
+            println!("  - WSL2 is not installed or enabled");
+            println!("  - Run 'wsl --install' to set up WSL2");
         }
 
         #[cfg(target_os = "linux")]

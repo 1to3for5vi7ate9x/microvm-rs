@@ -12,11 +12,10 @@ use crate::error::{Error, Result};
 // Platform-specific VcpuExit imports
 #[cfg(target_os = "macos")]
 use crate::backend::hvf::VcpuExit;
-#[cfg(target_os = "windows")]
-use crate::backend::whp::VcpuExit;
 
-// Provide a stub type for unsupported platforms
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+// Provide a stub type for platforms without native hypervisor vCPU support
+// (includes Windows/WSL2 which uses a process-based backend)
+#[cfg(not(target_os = "macos"))]
 #[derive(Debug, Clone)]
 pub enum VcpuExit {
     Unknown(u32),

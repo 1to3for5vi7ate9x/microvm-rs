@@ -902,7 +902,68 @@ impl VmRuntime {
         Ok(())
     }
 
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    /// Windows WSL2 event loop.
+    ///
+    /// Creates a WslBackend, starts the daemon, and runs a simple event loop
+    /// that bridges vsock messages over TCP and handles runtime commands.
+    #[cfg(target_os = "windows")]
+    fn run_event_loop(
+        config: RuntimeConfig,
+        vsock_rx: mpsc::Receiver<VsockMessage>,
+        mut cmd_rx: mpsc::Receiver<RuntimeCommand>,
+        _console_rx: Option<mpsc::Receiver<Vec<u8>>>,
+    ) -> Result<()> {
+        use crate::backend::wsl::WslBackend;
+        use crate::backend::{HypervisorBackend, VmConfig};
+        use crate::vsock::TcpVsockBridge;
+
+        let vm_config = VmConfig {
+            memory_mb: config.memory_mb,
+            vcpus: 1,
+            kernel: Some(config.kernel_path.clone()),
+            initrd: config.initrd_path.clone(),
+            rootfs: None,
+            cmdline: config.cmdline.clone(),
+        };
+
+        let mut backend = WslBackend::new(vm_config)?;
+        backend.start()?;
+
+        let mut vsock_handler = crate::vsock::VsockHandler::new(vsock_rx);
+        let mut bridge = TcpVsockBridge::new();
+
+        loop {
+            // Check for runtime commands
+            match cmd_rx.try_recv() {
+                Ok(RuntimeCommand::Shutdown) => {
+                    backend.shutdown()?;
+                    break;
+                }
+                Ok(RuntimeCommand::Kill) => {
+                    backend.kill()?;
+                    break;
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    backend.shutdown()?;
+                    break;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+
+            // Process vsock messages by bridging to TCP
+            while let Some(msg) = vsock_handler.try_recv() {
+                bridge.handle_message(msg);
+            }
+
+            // Small sleep to avoid busy-waiting
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        Ok(())
+    }
+
+    /// Fallback for unsupported platforms.
+    #[cfg(not(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "windows")))]
     fn run_event_loop(
         _config: RuntimeConfig,
         _vsock_rx: mpsc::Receiver<VsockMessage>,

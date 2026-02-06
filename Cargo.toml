@@ -3,11 +3,11 @@ name = "microvm"
 version = "0.1.0"
 edition = "2021"
 authors = ["Ankit Choudhary"]
-description = "Cross-platform, embeddable microVM library for Rust. Spawn lightweight VMs using native hypervisors (HVF, WHP, KVM)."
+description = "Cross-platform, embeddable microVM library for Rust. Spawn lightweight VMs using native hypervisors (HVF, KVM) or WSL2."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ArkProjectNFTs/microvm-rs"
 readme = "README.md"
-keywords = ["virtualization", "hypervisor", "microvm", "kvm", "hvf"]
+keywords = ["virtualization", "hypervisor", "microvm", "kvm", "wsl"]
 categories = ["virtualization", "os"]
 rust-version = "1.70"
 
@@ -16,7 +16,7 @@ default = []
 
 # Platform backends (auto-detected if not specified)
 hvf = []   # macOS Hypervisor.framework
-whp = []   # Windows Hypervisor Platform
+wsl = []   # Windows Subsystem for Linux 2
 kvm = []   # Linux KVM
 
 # Devices
@@ -44,11 +44,8 @@ tracing = { version = "0.1", optional = true }
 # HVF bindings - we'll write our own
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.52", features = [
-    "Win32_Foundation",
-    "Win32_System_Hypervisor",
-    "Win32_System_Memory",
-] }
+# WSL2 backend has no Windows-specific crate dependencies.
+# It communicates via wsl.exe CLI and localhost TCP.
 
 [target.'cfg(target_os = "linux")'.dependencies]
 kvm-ioctls = { version = "0.16", optional = true }

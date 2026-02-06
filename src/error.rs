@@ -75,8 +75,8 @@ pub enum Error {
     HvfError(i32),
 
     #[cfg(target_os = "windows")]
-    #[error("WHP error: {0}")]
-    WhpError(String),
+    #[error("WSL error: {0}")]
+    WslError(String),
 
     #[cfg(target_os = "linux")]
     #[error("KVM error: {0}")]
@@ -98,8 +98,8 @@ impl Error {
     }
 
     #[cfg(target_os = "windows")]
-    pub fn from_whp(msg: impl Into<String>) -> Self {
-        Error::WhpError(msg.into())
+    pub fn from_wsl(msg: impl Into<String>) -> Self {
+        Error::WslError(msg.into())
     }
 
     #[cfg(target_os = "linux")]

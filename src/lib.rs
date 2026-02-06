@@ -20,7 +20,7 @@
 //! ## Platform Support
 //!
 //! - **macOS**: Hypervisor.framework (Intel + Apple Silicon)
-//! - **Windows**: Windows Hypervisor Platform (WHP)
+//! - **Windows**: WSL2 (Windows Subsystem for Linux)
 //! - **Linux**: KVM (future)
 
 mod builder;

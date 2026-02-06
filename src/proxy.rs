@@ -716,8 +716,8 @@ pub fn create_vsock_listener(port: u32) -> io::Result<i32> {
 
 #[cfg(target_os = "windows")]
 pub fn create_vsock_listener(_port: u32) -> io::Result<i32> {
-    // Windows uses Hyper-V sockets (AF_HYPERV) for VM communication.
-    // This is handled differently through the WHP backend.
+    // Windows uses TCP over localhost for VM communication (WSL2 shares the host network namespace).
+    // This is handled through the TcpVsockBridge in the WSL2 backend.
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "Host vsock listener not directly supported on Windows - use VmRuntime integration"
