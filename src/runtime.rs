@@ -38,24 +38,35 @@
 //! ```
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{Error, Result};
-use crate::vsock::{VsockClient, VsockHandler, VsockMessage};
+use crate::vsock::{VsockClient, VsockMessage};
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::sync::Arc;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::time::Instant;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use crate::vsock::VsockHandler;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::proxy::{ProxyConnectionManager, OUTBOUND_PROXY_PORT};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::{debug_runtime, debug_vsock};
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 /// A writer that sends output through a channel
 struct ChannelWriter {
     tx: mpsc::Sender<Vec<u8>>,
     buffer: Vec<u8>,
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl ChannelWriter {
     fn new(tx: mpsc::Sender<Vec<u8>>) -> Self {
         Self {
@@ -65,6 +76,7 @@ impl ChannelWriter {
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl std::io::Write for ChannelWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         // Also write to stdout for debugging
@@ -173,11 +185,31 @@ impl RuntimeHandle {
     pub fn is_running(&self) -> bool {
         self.thread_handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false)
     }
+
+    /// Spawn an interactive shell inside the VM with piped stdio.
+    ///
+    /// On Windows (WSL2 backend), this launches a second `wsl.exe` process
+    /// into the same distro, independent of the runtime event loop.
+    /// The returned `Child` has piped stdin/stdout/stderr suitable for
+    /// wiring to a terminal emulator (e.g. xterm.js).
+    #[cfg(target_os = "windows")]
+    pub fn spawn_shell(&self) -> Result<std::process::Child> {
+        crate::backend::wsl::spawn_shell()
+    }
+
+    /// Spawn an interactive shell inside the VM with piped stdio.
+    ///
+    /// Currently only supported on the WSL2 backend (Windows).
+    #[cfg(not(target_os = "windows"))]
+    pub fn spawn_shell(&self) -> Result<std::process::Child> {
+        Err(Error::NotSupported("Interactive shell only available on WSL2 backend".into()))
+    }
 }
 
 /// VM runtime with full device support.
 pub struct VmRuntime {
     config: RuntimeConfig,
+    #[allow(dead_code)] // Kept alive to prevent channel closure
     vsock_tx: mpsc::Sender<VsockMessage>,
     vsock_rx: Option<mpsc::Receiver<VsockMessage>>,
 }
@@ -223,7 +255,12 @@ impl VmRuntime {
         };
 
         let thread_handle = thread::spawn(move || {
+            eprintln!("[RUNTIME] Event loop thread started");
             let result = Self::run_event_loop(config, vsock_rx, cmd_rx, console_rx);
+            match &result {
+                Ok(()) => eprintln!("[RUNTIME] Event loop exited normally"),
+                Err(e) => eprintln!("[RUNTIME] Event loop exited with error: {}", e),
+            }
             let _ = shutdown_tx.send(result);
         });
 
@@ -906,12 +943,14 @@ impl VmRuntime {
     ///
     /// Creates a WslBackend, starts the daemon, and runs a simple event loop
     /// that bridges vsock messages over TCP and handles runtime commands.
+    /// Daemon stdout is forwarded to `console_tx` so Velocitty's MicrovmConsole
+    /// receives log output.
     #[cfg(target_os = "windows")]
     fn run_event_loop(
         config: RuntimeConfig,
         vsock_rx: mpsc::Receiver<VsockMessage>,
         mut cmd_rx: mpsc::Receiver<RuntimeCommand>,
-        _console_rx: Option<mpsc::Receiver<Vec<u8>>>,
+        mut console_rx: Option<mpsc::Receiver<Vec<u8>>>,
     ) -> Result<()> {
         use crate::backend::wsl::WslBackend;
         use crate::backend::{HypervisorBackend, VmConfig};
@@ -926,8 +965,34 @@ impl VmRuntime {
             cmdline: config.cmdline.clone(),
         };
 
+        eprintln!("[RUNTIME] WSL2: Creating backend...");
         let mut backend = WslBackend::new(vm_config)?;
+        eprintln!("[RUNTIME] WSL2: Starting backend (importing distro + launching daemon)...");
         backend.start()?;
+        eprintln!("[RUNTIME] WSL2: Backend started successfully, entering event loop");
+
+        // Pipe daemon stdout to console_tx so Velocitty sees daemon logs
+        if let Some(stdout) = backend.take_daemon_stdout() {
+            if let Some(console_tx) = config.console_tx.clone() {
+                thread::spawn(move || {
+                    use std::io::Read;
+                    let mut reader = std::io::BufReader::new(stdout);
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match reader.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                let _ = console_tx.blocking_send(buf[..n].to_vec());
+                            }
+                            Err(e) => {
+                                eprintln!("[WSL2] Daemon stdout read error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        }
 
         let mut vsock_handler = crate::vsock::VsockHandler::new(vsock_rx);
         let mut bridge = TcpVsockBridge::new();
@@ -950,13 +1015,20 @@ impl VmRuntime {
                 Err(mpsc::error::TryRecvError::Empty) => {}
             }
 
+            // Drain console input to keep the channel alive (WSL2 has no kernel
+            // console — interactive use goes through MicrovmShell instead).
+            if let Some(ref mut rx) = console_rx {
+                while let Ok(_) = rx.try_recv() { /* discard */ }
+            }
+
             // Process vsock messages by bridging to TCP
             while let Some(msg) = vsock_handler.try_recv() {
                 bridge.handle_message(msg);
             }
 
-            // Small sleep to avoid busy-waiting
-            std::thread::sleep(Duration::from_millis(10));
+            // Reduce sleep when there are active connections for lower latency
+            let sleep_ms = if bridge.has_connections() { 1 } else { 10 };
+            std::thread::sleep(Duration::from_millis(sleep_ms));
         }
 
         Ok(())

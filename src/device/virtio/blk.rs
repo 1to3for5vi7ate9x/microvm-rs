@@ -38,6 +38,7 @@ pub mod blk_features {
 }
 
 /// Block request types.
+#[allow(dead_code)]
 mod request_type {
     pub const IN: u32 = 0;      // Read
     pub const OUT: u32 = 1;     // Write
@@ -90,6 +91,7 @@ pub struct VirtioBlk {
     /// Interrupt status (bit 0 = used buffer notification)
     interrupt_status: u32,
     /// Configuration generation counter
+    #[allow(dead_code)]
     config_generation: u32,
 }
 

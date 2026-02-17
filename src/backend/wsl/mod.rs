@@ -47,6 +47,83 @@ pub fn is_available() -> bool {
     process::check_wsl_available()
 }
 
+/// Full cleanup of the microvm WSL2 distro and its data.
+///
+/// Best-effort: terminates the distro, unregisters it (deletes the ext4.vhdx),
+/// and removes the data directory (`%LOCALAPPDATA%\microvm-rs\`).
+/// Individual errors are logged but do not prevent subsequent steps.
+pub fn cleanup() {
+    eprintln!("[WSL2] cleanup: terminating distro...");
+    if let Ok(output) = process::run_wsl(&["--terminate", DEFAULT_DISTRO_NAME]) {
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("[WSL2] cleanup: terminate warning: {}", stderr.trim());
+        }
+    }
+
+    eprintln!("[WSL2] cleanup: unregistering distro...");
+    if let Ok(output) = process::run_wsl(&["--unregister", DEFAULT_DISTRO_NAME]) {
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("[WSL2] cleanup: unregister warning: {}", stderr.trim());
+        }
+    }
+
+    eprintln!("[WSL2] cleanup: removing data directory...");
+    if let Ok(dir) = rootfs::data_dir() {
+        if dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                eprintln!("[WSL2] cleanup: remove_dir_all warning: {}", e);
+            }
+        }
+    }
+
+    eprintln!("[WSL2] cleanup: done");
+}
+
+/// Spawn a shell inside the microvm WSL distro with piped stdio.
+///
+/// Returns a `Child` whose stdin/stdout/stderr are piped, suitable for
+/// programmatic use (e.g. wiring to xterm.js in Velocitty).
+///
+/// The distro must already exist (i.e. `cargo run -- run` must have been
+/// executed at least once to import it).
+pub fn spawn_shell() -> Result<std::process::Child> {
+    if !distro::WslDistro::exists(DEFAULT_DISTRO_NAME)? {
+        return Err(Error::WslError(
+            "microvm-rs distro not found. Run 'microvm run' first to create it.".into(),
+        ));
+    }
+    // Use -i to force interactive mode (prompt + command reading) even with
+    // piped stdio.  Without -i the shell sees no TTY and stays silent.
+    // Note: there is no character echo (no PTY), but commands work.
+    process::spawn_wsl_interactive(&[
+        "-d", DEFAULT_DISTRO_NAME, "--cd", "/root", "--", "/bin/sh", "-i",
+    ])
+}
+
+/// Open an interactive shell inside the microvm WSL distro.
+///
+/// Inherits stdin/stdout/stderr from the calling process, giving the user
+/// a direct terminal session. Blocks until the user exits the shell.
+pub fn run_shell_interactive() -> Result<()> {
+    if !distro::WslDistro::exists(DEFAULT_DISTRO_NAME)? {
+        return Err(Error::WslError(
+            "microvm-rs distro not found. Run 'microvm run' first to create it.".into(),
+        ));
+    }
+    let mut child = process::spawn_wsl_inherited(&[
+        "-d", DEFAULT_DISTRO_NAME, "--cd", "/root", "--", "/bin/sh", "-l",
+    ])?;
+    let status = child.wait().map_err(|e| Error::WslError(format!("Shell process error: {}", e)))?;
+    if !status.success() {
+        if let Some(code) = status.code() {
+            return Err(Error::WslError(format!("Shell exited with code {}", code)));
+        }
+    }
+    Ok(())
+}
+
 impl WslBackend {
     /// Create a new WSL2 backend with the given configuration.
     pub fn new(config: VmConfig) -> Result<Self> {
@@ -58,6 +135,13 @@ impl WslBackend {
         })
     }
 
+    /// Take the daemon process's stdout handle.
+    ///
+    /// Returns `None` if the daemon isn't running or stdout was already taken.
+    pub fn take_daemon_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.daemon_process.as_mut().and_then(|child| child.stdout.take())
+    }
+
     /// Ensure the WSL distro is imported and ready.
     fn ensure_distro(&mut self) -> Result<()> {
         if self.distro.is_some() {
@@ -67,8 +151,67 @@ impl WslBackend {
         let install_path = rootfs::wsl_install_path()?;
         let rootfs_path = rootfs::extract_rootfs(self.config.rootfs.as_ref())?;
 
+        let needs_setup = !WslDistro::exists(DEFAULT_DISTRO_NAME)?;
         let distro = WslDistro::ensure_exists(DEFAULT_DISTRO_NAME, &install_path, &rootfs_path)?;
+
+        if needs_setup {
+            eprintln!("[WSL2] First run — provisioning distro...");
+            self.provision_distro(&distro)?;
+        }
+
         self.distro = Some(distro);
+        Ok(())
+    }
+
+    /// Provision a freshly-imported distro with packages and scripts.
+    fn provision_distro(&self, distro: &WslDistro) -> Result<()> {
+        // Configure WSL to not mount Windows drives — keeps the VM isolated
+        eprintln!("[WSL2] Configuring wsl.conf for isolation...");
+        let wsl_conf = b"[automount]\nenabled = false\n\n[interop]\nappendWindowsPath = false\n";
+        let output = distro.exec_with_stdin("tee", &["/etc/wsl.conf"], wsl_conf)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("[WSL2] Warning: failed to write wsl.conf: {}", stderr);
+        }
+
+        // Install socat (needed for the control daemon)
+        eprintln!("[WSL2] Installing packages...");
+        let output = distro.exec("sh", &["-c", "apk update && apk add --no-cache socat"])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("[WSL2] Warning: package install failed: {}", stderr);
+            // Continue anyway — the fallback nc listener may work
+        }
+
+        // Write the init script into the distro via stdin (avoids shell escaping issues)
+        eprintln!("[WSL2] Installing init script...");
+        let init_script = include_str!("../../../guest/wsl-rootfs/init-microvm.sh");
+
+        // Create directory first
+        let output = distro.exec("sh", &["-c", "mkdir -p /etc/microvm"])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::WslError(format!("Failed to create /etc/microvm: {}", stderr)));
+        }
+
+        // Pipe the script content via stdin to tee
+        let output = distro.exec_with_stdin(
+            "tee", &["/etc/microvm/init-microvm.sh"],
+            init_script.as_bytes(),
+        )?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::WslError(format!("Failed to install init script: {}", stderr)));
+        }
+
+        // Make it executable
+        let output = distro.exec("chmod", &["+x", "/etc/microvm/init-microvm.sh"])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::WslError(format!("Failed to chmod init script: {}", stderr)));
+        }
+
+        eprintln!("[WSL2] Provisioning complete.");
         Ok(())
     }
 

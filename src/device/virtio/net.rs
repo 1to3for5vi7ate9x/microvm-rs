@@ -296,7 +296,7 @@ impl VirtioNet {
             return false;
         }
 
-        while let Some((head_idx, first_desc)) = self.tx_queue.pop_available(memory) {
+        while let Some((_head_idx, first_desc)) = self.tx_queue.pop_available(memory) {
             // Collect the packet data from the descriptor chain
             let mut packet_data = Vec::new();
             let mut skip_header = true;
@@ -315,6 +315,9 @@ impl VirtioNet {
                     }
                 }
             }
+            // skip_header is intentionally set above for the first descriptor only;
+            // chained descriptors are always appended without header stripping.
+            let _ = skip_header;
 
             // Follow the chain
             let mut next_idx = if first_desc.has_next() { Some(first_desc.next) } else { None };
@@ -381,6 +384,7 @@ impl VirtioNet {
                     }
                 }
             }
+            let _ = skip_header;
 
             // Follow the chain
             let mut next_idx = if first_desc.has_next() { Some(first_desc.next) } else { None };

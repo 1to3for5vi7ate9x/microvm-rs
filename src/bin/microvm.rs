@@ -42,6 +42,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     match args[1].as_str() {
         "run" => cmd_run(&args[2..])?,
+        "shell" => cmd_shell()?,
         "info" => cmd_info()?,
         "help" | "--help" | "-h" => print_usage(&args[0]),
         "version" | "--version" | "-V" => print_version(),
@@ -64,6 +65,7 @@ USAGE:
 
 COMMANDS:
     run     Run a virtual machine
+    shell   Open interactive shell in the VM (WSL2)
     info    Show hypervisor information
     help    Show this help message
     version Show version information
@@ -131,6 +133,36 @@ fn cmd_info() -> Result<(), Box<dyn std::error::Error>> {
     println!("Platform: Linux (KVM)");
 
     Ok(())
+}
+
+fn cmd_shell() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "windows")]
+    {
+        if !microvm::is_supported() {
+            return Err("WSL2 is not available on this system".into());
+        }
+
+        // Check that the distro exists
+        use microvm::backend::wsl::distro::{WslDistro, DEFAULT_DISTRO_NAME};
+        if !WslDistro::exists(DEFAULT_DISTRO_NAME)? {
+            return Err(
+                "microvm-rs distro not found.\n\
+                 Run 'microvm run' first to create and provision the VM."
+                    .into(),
+            );
+        }
+
+        println!("microvm shell — Entering WSL2 distro (type 'exit' to leave)");
+        println!();
+
+        microvm::backend::wsl::run_shell_interactive()?;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("The 'shell' command is only available on Windows (WSL2 backend)".into())
+    }
 }
 
 fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -207,85 +239,92 @@ fn cmd_run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         i += 1;
     }
 
-    let kernel_path = kernel_path.ok_or("Kernel path is required")?;
-
     // Check hypervisor availability
     if !microvm::is_supported() {
         return Err("Hypervisor is not available on this system".into());
     }
 
-    println!("microvm - Starting VM");
-    println!("=====================");
-    println!("Kernel: {}", kernel_path.display());
-    if let Some(ref initrd) = initrd_path {
-        println!("Initrd: {}", initrd.display());
-    }
-    if let Some(ref disk) = disk_path {
-        println!("Disk: {}", disk.display());
-    }
-    println!("Memory: {} MB", memory_mb);
-    println!("vCPUs: {}", cpus);
-    if enable_console {
-        println!("Console: VirtIO console (hvc0)");
-    }
-    if enable_net {
-        println!("Network: VirtIO net (null backend - vmnet disabled)");
-    }
-    if !cmdline.is_empty() {
-        println!("Cmdline: {}", cmdline);
-    }
-    println!();
-
-    // Load kernel
-    let mut loader = LinuxLoader::new(&kernel_path)?
-        .with_memory_mb(memory_mb);
-
-    if let Some(ref initrd) = initrd_path {
-        loader = loader.with_initrd(initrd)?;
-    }
-
-    // Set default command line if not specified
-    if cmdline.is_empty() {
-        #[cfg(target_arch = "aarch64")]
-        {
-            // Always use PL011 (ttyAMA0) as initial console so init can output
-            // The init script will switch to hvc0 after loading virtio modules
-            cmdline = "console=ttyAMA0 earlycon=pl011,0x09000000 rdinit=/init panic=1".to_string();
-        }
-        #[cfg(target_arch = "x86_64")]
-        {
-            cmdline = "console=ttyS0 earlyprintk=serial panic=1".to_string();
-        }
-    }
-
-    // Note: The initrd's /init will run by default.
-    // To force an interactive shell, use: --cmdline "... rdinit=/bin/sh"
-
-    loader = loader.with_cmdline(&cmdline);
-
-    // Create VM config
-    let config = VmConfig {
-        memory_mb,
-        vcpus: cpus,
-        kernel: Some(kernel_path),
-        initrd: initrd_path,
-        rootfs: disk_path.clone(),
-        cmdline: cmdline.clone(),
-    };
-
-    // Windows: use WSL2 backend (process-based, no vCPU emulation)
+    // Windows: use WSL2 backend (process-based, no kernel/vCPU needed)
     #[cfg(target_os = "windows")]
     {
+        println!("microvm - Starting VM (WSL2)");
+        println!("============================");
+        println!("Backend: WSL2 (Alpine Linux)");
+        println!("Memory: {} MB", memory_mb);
+        println!();
+
+        let config = VmConfig {
+            memory_mb,
+            vcpus: cpus,
+            kernel: kernel_path,
+            initrd: initrd_path,
+            rootfs: disk_path.clone(),
+            cmdline: cmdline.clone(),
+        };
+
         let mut backend = WslBackend::new(config)?;
-        println!("\nStarting WSL2 backend...");
         run_vm_loop(&mut backend)?;
         println!("\nVM stopped.");
         return Ok(());
     }
 
-    // macOS / Linux: use native hypervisor backend with vCPU emulation
+    // macOS / Linux: use native hypervisor backend with kernel + vCPU emulation
     #[cfg(not(target_os = "windows"))]
     {
+        let kernel_path = kernel_path.ok_or("Kernel path is required (use --kernel <PATH>)")?;
+
+        println!("microvm - Starting VM");
+        println!("=====================");
+        println!("Kernel: {}", kernel_path.display());
+        if let Some(ref initrd) = initrd_path {
+            println!("Initrd: {}", initrd.display());
+        }
+        if let Some(ref disk) = disk_path {
+            println!("Disk: {}", disk.display());
+        }
+        println!("Memory: {} MB", memory_mb);
+        println!("vCPUs: {}", cpus);
+        if enable_console {
+            println!("Console: VirtIO console (hvc0)");
+        }
+        if enable_net {
+            println!("Network: VirtIO net (null backend - vmnet disabled)");
+        }
+        if !cmdline.is_empty() {
+            println!("Cmdline: {}", cmdline);
+        }
+        println!();
+
+        // Load kernel
+        let mut loader = LinuxLoader::new(&kernel_path)?
+            .with_memory_mb(memory_mb);
+
+        if let Some(ref initrd) = initrd_path {
+            loader = loader.with_initrd(initrd)?;
+        }
+
+        // Set default command line if not specified
+        if cmdline.is_empty() {
+            #[cfg(target_arch = "aarch64")]
+            {
+                cmdline = "console=ttyAMA0 earlycon=pl011,0x09000000 rdinit=/init panic=1".to_string();
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                cmdline = "console=ttyS0 earlyprintk=serial panic=1".to_string();
+            }
+        }
+
+        loader = loader.with_cmdline(&cmdline);
+
+        let config = VmConfig {
+            memory_mb,
+            vcpus: cpus,
+            kernel: Some(kernel_path),
+            initrd: initrd_path,
+            rootfs: disk_path.clone(),
+            cmdline: cmdline.clone(),
+        };
         let mut vm = Vm::new(&config)?;
 
         // Load kernel into memory

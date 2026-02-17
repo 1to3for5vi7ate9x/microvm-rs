@@ -58,3 +58,4 @@ initramfs/
 *.profdata
 coverage/
 vm/
+#docs/

@@ -728,7 +728,7 @@ impl VirtioVsock {
             return;
         }
 
-        let num_chunks = (data.len() + MAX_PAYLOAD_PER_CHUNK - 1) / MAX_PAYLOAD_PER_CHUNK;
+        let _num_chunks = (data.len() + MAX_PAYLOAD_PER_CHUNK - 1) / MAX_PAYLOAD_PER_CHUNK;
 
         let mut offset = 0;
         while offset < data.len() {

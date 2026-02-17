@@ -21,6 +21,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
@@ -59,7 +60,10 @@ pub enum VsockMessage {
 }
 
 /// A connection to a guest vsock port.
-#[derive(Debug, Clone)]
+///
+/// Automatically sends a `Close` message when dropped to prevent TCP connection leaks
+/// in the `TcpVsockBridge`.
+#[derive(Debug)]
 pub struct VsockConnection {
     /// Local (host) port
     pub local_port: u32,
@@ -69,6 +73,8 @@ pub struct VsockConnection {
     pub guest_cid: u64,
     /// Channel to send messages to the VM loop
     tx: mpsc::Sender<VsockMessage>,
+    /// Whether this connection has already been closed.
+    closed: AtomicBool,
 }
 
 impl VsockConnection {
@@ -97,12 +103,30 @@ impl VsockConnection {
         response_rx.await.map_err(|e| format!("Response channel closed: {}", e))?
     }
 
-    /// Close the connection.
+    /// Close the connection explicitly.
+    ///
+    /// This is optional — `Drop` will also send a close message. Use this if you
+    /// want to handle errors from the close operation.
     pub async fn close(&self) -> Result<(), String> {
+        if self.closed.swap(true, Ordering::Relaxed) {
+            return Ok(()); // Already closed
+        }
         self.tx.send(VsockMessage::Close {
             local_port: self.local_port,
             guest_port: self.guest_port,
         }).await.map_err(|e| format!("Channel closed: {}", e))
+    }
+}
+
+impl Drop for VsockConnection {
+    fn drop(&mut self) {
+        if self.closed.swap(true, Ordering::Relaxed) {
+            return; // Already closed
+        }
+        let _ = self.tx.try_send(VsockMessage::Close {
+            local_port: self.local_port,
+            guest_port: self.guest_port,
+        });
     }
 }
 
@@ -130,7 +154,7 @@ impl VsockClient {
 
     /// Connect to a guest port.
     pub async fn connect(&self, guest_port: u32) -> Result<VsockConnection, String> {
-        let local_port = {
+        let _local_port = {
             let mut port = self.next_port.lock().unwrap();
             let p = *port;
             *port += 1;
@@ -155,6 +179,7 @@ impl VsockClient {
             guest_port,
             guest_cid: self.guest_cid,
             tx: self.tx.clone(),
+            closed: AtomicBool::new(false),
         })
     }
 
@@ -177,7 +202,7 @@ impl VsockClient {
         let extra_iterations = request.len() / 1000; // +10ms per KB
         let max_iterations = base_iterations + extra_iterations;
 
-        for i in 0..max_iterations {
+        for _i in 0..max_iterations {
             match conn.recv().await {
                 Ok(data) if !data.is_empty() => {
                     return Ok(data);
@@ -305,6 +330,11 @@ impl TcpVsockBridge {
         Self {
             connections: HashMap::new(),
         }
+    }
+
+    /// Returns true if there are active TCP connections.
+    pub fn has_connections(&self) -> bool {
+        !self.connections.is_empty()
     }
 
     /// Process a VsockMessage by mapping it to TCP operations.

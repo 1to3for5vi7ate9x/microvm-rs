@@ -45,6 +45,20 @@ pub use vsock::{VsockClient, VsockConnection, VsockHandler, VsockMessage, create
 pub use runtime::{VmRuntime, RuntimeConfig, RuntimeHandle};
 pub use proxy::{ProxyConnectionManager, OUTBOUND_PROXY_PORT};
 
+/// Spawn an interactive shell inside the VM (WSL2 backend, piped stdio).
+///
+/// Convenience re-export for Velocitty integration.
+#[cfg(target_os = "windows")]
+pub use backend::wsl::spawn_shell as spawn_vm_shell;
+
+/// Full cleanup of the WSL2 distro and its on-disk data.
+///
+/// Terminates the running distro, unregisters it (deletes the ext4.vhdx),
+/// and removes the `%LOCALAPPDATA%\microvm-rs\` directory.
+/// Best-effort — individual failures are logged but do not block the rest.
+#[cfg(target_os = "windows")]
+pub use backend::wsl::cleanup as cleanup_vm;
+
 /// Check if the current platform supports hardware virtualization.
 ///
 /// Returns `true` if the hypervisor is available and can be used.

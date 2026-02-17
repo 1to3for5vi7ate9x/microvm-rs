@@ -601,6 +601,7 @@ pub trait MemoryWriter {
 }
 
 /// Align value up to the given alignment.
+#[allow(dead_code)]
 fn align_up(value: u64, alignment: u64) -> u64 {
     (value + alignment - 1) & !(alignment - 1)
 }

@@ -40,26 +40,37 @@ SSH Client → localhost:1080 (SOCKS5) → Lima VM → OpenVPN → Target
             Lima port forwarding (slow, fragile)
 ```
 
-Target flow with microvm-rs:
+Target flow with microvm-rs (macOS/Linux):
 ```
 SSH Client → vsock (SOCKS5) → microvm → OpenVPN → Target
                     ↑
             Direct vsock channel (fast, reliable)
 ```
 
+Target flow with microvm-rs (Windows):
+```
+SSH Client → localhost:1080 (SOCKS5) → WSL2 distro → OpenVPN → Target
+                    ↑
+            Shared network namespace (no port forwarding needed)
+```
+
 ---
 
 ## Current Status
 
-**Phase:** Initial Development
-**Platform Focus:** macOS (Hypervisor.framework) first, then Windows (WHP)
+**Phase:** Active Development
+**Platform Focus:** macOS (HVF) + Windows (WSL2) in parallel
 
 ### Development Order
-1. **macOS (HVF)** — Primary development platform (current)
-2. **Windows (WHP)** — Secondary platform (will clone repo to Windows machine)
+1. **macOS (HVF)** — Primary development platform
+2. **Windows (WSL2)** — Secondary platform (active development)
 3. **Linux (KVM)** — Future, if needed (best documented, can add later)
 
+> **Note:** Windows backend was changed from WHP (Windows Hypervisor Platform) to WSL2 in Feb 2026 due to unfixable MSR bugs in the WHP API. See `docs/current_state.md` for details.
+
 ### What's Done
+
+**Core / macOS (HVF):**
 - [x] Project specification (`microvm-rs.md`)
 - [x] CLAUDE.md context file
 - [x] Initial project structure
@@ -77,56 +88,42 @@ SSH Client → vsock (SOCKS5) → microvm → OpenVPN → Target
 - [x] Linux kernel loader module (ARM64 Image + x86_64 bzImage)
 - [x] Device tree builder for ARM64 boot
 - [x] E820 memory map and GDT for x86_64 boot
-- [x] WHP backend for Windows (basic VM creation, memory, vCPU)
-- [x] **MILESTONE: hello_vm test working on Windows WHP!**
-- [x] WHP 64-bit long mode CPU setup
-- [x] WHP I/O port emulation (serial, PIT, PCI config)
-- [x] WHP CPUID emulation
-- [x] WHP APIC emulation configuration
-- [x] WHP MSR->Register mapping (FS_BASE, GS_BASE, KERNEL_GS_BASE, EFER, STAR, LSTAR, CSTAR, SFMASK)
-- [x] Fixed WHP exit context bug (RAX/RDX corruption in MSR exits)
-- [x] Fixed instruction length handling for MSR/CPUID/RDTSC exits
-- [x] Linux kernel boots to 64-bit mode and sets up per-CPU data
+
+**Windows (WSL2 backend):**
+- [x] WSL2 backend replacing WHP (process-based, manages WSL distro lifecycle)
+- [x] **MILESTONE: Alpine Linux boots in WSL2 with control daemon!**
+- [x] Embedded Alpine minirootfs (3.5MB, compiled into binary)
+- [x] Distro lifecycle management (import, provision, terminate, unregister)
+- [x] Control daemon on TCP port 1025 (ping, status, pause, resume, shutdown)
+- [x] Interactive shell access (spawn_shell, run_shell_interactive)
+- [x] UTF-16LE output decoding for WSL management commands
+- [x] TcpVsockBridge for host-guest communication via localhost
+- [x] Auto-provisioning (socat install, init script deployment)
+- [x] Cleanup utilities (distro unregister, data directory removal)
+
+**Cross-platform:**
+- [x] VsockClient/VsockHandler async API
+- [x] ProxyConnectionManager (outbound TCP proxy protocol)
+- [x] VmRuntime with platform-specific event loops
 
 ### Known Limitations
 
-#### Windows WHP MSR Handling Bug
-WHP has a significant limitation where MSR exits don't properly report the MSR number being accessed. The `MsrNumber` field in the exit context and the `ECX` register (which should contain the MSR number per x86 spec) both show 0 instead of the actual MSR number.
+#### Windows: WHP Abandoned
+The original WHP (Windows Hypervisor Platform) backend was abandoned due to unfixable MSR handling bugs — standard Linux kernels cannot fully boot because WHP doesn't properly report MSR numbers during exits. See `docs/current_state.md` for the full history.
 
-**Investigation performed:**
-- Tried reading ECX register directly during MSR exits - WHP clears it to 0
-- Tried instruction decoding (looking for `mov ecx, imm32` patterns before RDMSR/WRMSR) - kernel uses indirect MSR access via paravirt
-- Tried reading MSR number from memory via RDX register (for `mov ecx, [rdx]` patterns) - the memory locations are uninitialized (contain 0)
-- QEMU's WHPX backend has the same issue and just returns 0 for all RDMSR and ignores all WRMSR
-- **NEW FINDING**: WHP also corrupts RAX/RDX values in the MSR exit context - must read actual registers
-- **NEW FINDING**: WHP reports wrong instruction lengths (e.g., 1 instead of 2 for RDMSR/WRMSR)
-- **PARTIAL SUCCESS**: When RCX contains the MSR number (non-paravirt access), we can detect and handle it correctly
-- **PARTIAL SUCCESS**: Mapped special MSRs (FS_BASE, GS_BASE, KERNEL_GS_BASE, EFER, etc.) to WHP register equivalents
-
-**Current State:**
-- Kernel boots into 64-bit long mode
-- GS_BASE/FS_BASE MSRs are handled correctly when accessible
-- Kernel crashes during timer calibration (Divide Error #DE)
-- Unknown MSRs (msr=0x0 due to paravirt) still cannot be identified
-
-**Impact:** Standard Linux kernels cannot fully boot because they rely on MSRs for:
-- CPU feature detection
-- APIC configuration
-- Timer calibration (TSC, kvmclock) - **causes Divide Error**
-- Paravirt operations - **cannot detect MSR number**
-
-**Workaround options:**
-1. Use a custom-built minimal kernel that avoids paravirt MSR patterns
-2. Use the KVM backend on Linux or HVF on macOS (both have proper MSR support)
-3. Wait for Microsoft to fix the WHP MSR handling
-4. Build kernel with `CONFIG_PARAVIRT=n` and minimal MSR usage
+#### Windows: WSL2 Backend Limitations
+- **Not a true hypervisor** — WSL2 backend is a "process backend" that manages a WSL distro, not CPU emulation
+- **No memory/CPU isolation** — WSL2 uses host resources directly
+- **pause/resume are stubs** — daemon acknowledges commands but doesn't actually pause processes
+- **No VPN integration yet** — SOCKS5 proxy and OpenVPN not deployed in guest
 
 ### What's Next
-- [ ] Boot real Linux kernel on macOS (HVF) - primary path forward
+- [ ] Deploy SOCKS5 proxy server in WSL2 guest (for Velocitty VPN routing)
+- [ ] Deploy OpenVPN client in WSL2 guest
+- [ ] Add VPN lifecycle commands to daemon (vpn-start, vpn-stop, vpn-status)
+- [ ] Boot real Linux kernel on macOS (HVF)
 - [ ] Port KVM backend for Linux
 - [ ] TAP backend for virtio-net
-- [ ] User-mode NAT/SOCKS backend
-- [ ] Investigate WHP MSR workarounds or wait for API improvements
 
 ---
 
@@ -157,7 +154,7 @@ WHP has a significant limitation where MSR exits don't properly report the MSR n
 │  └───────────────────────────────────────────────────────────┘  │
 │           │                    │                    │           │
 │  ┌────────┴───────┐  ┌────────┴───────┐  ┌────────┴───────┐   │
-│  │  HVF Backend   │  │  WHP Backend   │  │  KVM Backend   │   │
+│  │  HVF Backend   │  │  WSL2 Backend  │  │  KVM Backend   │   │
 │  │    (macOS)     │  │   (Windows)    │  │    (Linux)     │   │
 │  └────────────────┘  └────────────────┘  └────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
@@ -183,12 +180,11 @@ microvm-rs/
 │   │   │   ├── vm.rs          # VM implementation
 │   │   │   ├── vcpu.rs        # vCPU implementation
 │   │   │   └── memory.rs      # Memory mapping
-│   │   ├── whp/           # Windows Hypervisor Platform
-│   │   │   ├── mod.rs
-│   │   │   ├── bindings.rs
-│   │   │   ├── vm.rs
-│   │   │   ├── vcpu.rs
-│   │   │   └── memory.rs
+│   │   ├── wsl/           # Windows WSL2 (process backend)
+│   │   │   ├── mod.rs         # WslBackend + HypervisorBackend impl
+│   │   │   ├── process.rs     # wsl.exe CLI wrapper + UTF-16LE decoding
+│   │   │   ├── distro.rs      # WSL distro lifecycle management
+│   │   │   └── rootfs.rs      # Embedded Alpine rootfs extraction
 │   │   └── kvm/           # Linux KVM (future)
 │   │       └── mod.rs
 │   ├── device/
@@ -214,9 +210,13 @@ microvm-rs/
 │   └── boot_linux.rs      # Boot Linux kernel
 ├── tests/
 │   └── integration/
-├── guest/                 # Guest image building (future)
+├── guest/
 │   ├── kernel/            # Kernel configs
-│   └── rootfs/            # Rootfs building
+│   ├── rootfs/            # Rootfs building
+│   └── wsl-rootfs/        # WSL2 guest files
+│       ├── alpine-minirootfs.tar.gz  # Alpine 3.21.3 x86_64 (embedded)
+│       ├── init-microvm.sh           # Control daemon entrypoint
+│       └── setup.sh                  # Post-import provisioning (legacy)
 └── docs/
     └── architecture.md
 ```
@@ -251,23 +251,23 @@ microvm-rs/
 #[link(name = "Hypervisor", kind = "framework")]
 ```
 
-### Windows (WHP)
+### Windows (WSL2)
 
-**API Documentation:** https://docs.microsoft.com/en-us/virtualization/api/
-
-**Key Functions:**
-- `WHvCreatePartition()` — Create VM partition
-- `WHvSetupPartition()` — Finalize partition setup
-- `WHvMapGpaRange()` — Map memory
-- `WHvCreateVirtualProcessor()` — Create vCPU
-- `WHvRunVirtualProcessor()` — Run vCPU
+**Approach:** Process-based backend — manages a lightweight WSL2 Alpine Linux distro rather than CPU emulation. Communication uses localhost TCP (WSL2 shares host network namespace).
 
 **Requirements:**
-- Windows 10 version 1803+
-- Hyper-V enabled in Windows Features
+- Windows 10 version 2004+ or Windows 11
+- WSL2 enabled (`wsl --install`)
 - Virtualization enabled in BIOS
 
-**Crate:** Use `windows-rs` for bindings
+**Key Components:**
+- `wsl.exe` CLI for distro management (import, exec, terminate)
+- Embedded Alpine 3.21.3 minirootfs (3.5MB, compiled into binary via `include_bytes!`)
+- Control daemon on `localhost:1025` (socat-based, supports concurrent connections)
+- `TcpVsockBridge` maps vsock messages to TCP connections
+
+**Why WSL2 instead of WHP:**
+WHP (Windows Hypervisor Platform) was abandoned because its MSR exit handling is broken — it doesn't report which MSR is being accessed, making it impossible to boot standard Linux kernels. WSL2 sidesteps this entirely by using Microsoft's own Linux kernel.
 
 ### Linux (KVM) — Future
 
@@ -286,14 +286,16 @@ Best documented platform, can leverage rust-vmm ecosystem.
 
 1. **virtio-mmio over PCI** — Simpler, no PCI enumeration needed
 2. **Start with serial console** — Prove VM works before adding virtio devices
-3. **vsock for host-guest communication** — Cleaner than TCP port forwarding
+3. **vsock for host-guest communication** — Cleaner than TCP port forwarding (macOS/Linux use vsock, Windows uses TCP via TcpVsockBridge)
 4. **Async API** — Use tokio for non-blocking operations
+5. **WSL2 over WHP for Windows** — WHP MSR bugs are unfixable, WSL2 is reliable
+6. **Embedded rootfs for Windows** — Alpine minirootfs compiled into binary, zero external deps
 
 ### Open Questions
 
-1. **Guest image format?** — Raw disk image vs embedded initramfs
-2. **Network backend on macOS?** — vmnet.framework vs userspace NAT
-3. **ARM64 boot protocol?** — Different from x86 Linux boot protocol
+1. **Network backend on macOS?** — vmnet.framework vs userspace NAT
+2. **SOCKS5 server for guest?** — microsocks vs dante vs custom Rust implementation
+3. **VPN config delivery?** — How to pass OpenVPN config from host to guest
 
 ---
 
@@ -347,8 +349,14 @@ Best documented platform, can leverage rust-vmm ecosystem.
 - [x] virtio-net (guest networking) - with backend trait
 - [x] virtio-vsock (control channel) - with connection management
 - [x] Linux kernel loader - ARM64 Image + x86 bzImage
-- [ ] Boot Linux kernel (needs testing with real kernel)
-- [ ] Mount rootfs
+- [x] Windows: Boot Alpine Linux via WSL2 with control daemon
+- [x] Windows: Interactive shell access
+- [x] Windows: Host-guest TCP communication (TcpVsockBridge)
+- [ ] Windows: SOCKS5 proxy in guest
+- [ ] Windows: OpenVPN client in guest
+- [ ] Windows: VPN lifecycle management (start/stop/status)
+- [ ] macOS: Boot Linux kernel with HVF (needs testing with real kernel)
+- [ ] Mount rootfs (macOS/Linux)
 
 ---
 
@@ -357,7 +365,7 @@ Best documented platform, can leverage rust-vmm ecosystem.
 ### Documentation
 - [KVM API](https://www.kernel.org/doc/html/latest/virt/kvm/api.html) — Best reference even for other platforms
 - [Hypervisor.framework](https://developer.apple.com/documentation/hypervisor)
-- [WHP API](https://docs.microsoft.com/en-us/virtualization/api/)
+- [WSL2 Documentation](https://learn.microsoft.com/en-us/windows/wsl/)
 - [virtio Spec](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html)
 - [Linux Boot Protocol](https://www.kernel.org/doc/html/latest/x86/boot.html)
 
@@ -380,13 +388,16 @@ Best documented platform, can leverage rust-vmm ecosystem.
 cargo build
 
 # Build (Windows) — run on Windows machine
-cargo build --features whp
+cargo build
 
 # Run tests
 cargo test
 
 # Run example
 cargo run --example minimal
+
+# Run microvm CLI (Windows — boots WSL2 distro)
+cargo run --bin microvm
 
 # Check all platforms compile (CI)
 cargo check --all-features

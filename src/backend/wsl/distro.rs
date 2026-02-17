@@ -49,8 +49,10 @@ impl WslDistro {
         ])?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(Error::WslError(format!("Failed to import distro '{}': {}", name, stderr)));
+            let stderr = process::decode_wsl_output(&output.stderr);
+            let stdout = process::decode_wsl_output(&output.stdout);
+            let msg = if stderr.trim().is_empty() { stdout } else { stderr };
+            return Err(Error::WslError(format!("Failed to import distro '{}': {}", name, msg.trim())));
         }
 
         Ok(Self {
@@ -82,6 +84,13 @@ impl WslDistro {
         process::run_wsl(&wsl_args)
     }
 
+    /// Execute a command inside the distribution, piping data to its stdin.
+    pub fn exec_with_stdin(&self, cmd: &str, args: &[&str], stdin_data: &[u8]) -> Result<Output> {
+        let mut wsl_args = vec!["-d", &self.name, "--", cmd];
+        wsl_args.extend_from_slice(args);
+        process::run_wsl_with_stdin(&wsl_args, stdin_data)
+    }
+
     /// Execute a command inside the distribution as a background process.
     pub fn exec_background(&self, cmd: &str, args: &[&str]) -> Result<Child> {
         let mut wsl_args = vec!["-d", &self.name, "--", cmd];
@@ -93,7 +102,7 @@ impl WslDistro {
     pub fn terminate(&self) -> Result<()> {
         let output = process::run_wsl(&["--terminate", &self.name])?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = process::decode_wsl_output(&output.stderr);
             return Err(Error::WslError(format!("Failed to terminate distro '{}': {}", self.name, stderr)));
         }
         Ok(())
@@ -103,7 +112,7 @@ impl WslDistro {
     pub fn unregister(&self) -> Result<()> {
         let output = process::run_wsl(&["--unregister", &self.name])?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = process::decode_wsl_output(&output.stderr);
             return Err(Error::WslError(format!("Failed to unregister distro '{}': {}", self.name, stderr)));
         }
         Ok(())
@@ -117,5 +126,22 @@ impl WslDistro {
     /// Get the install path.
     pub fn install_path(&self) -> &PathBuf {
         &self.install_path
+    }
+
+    /// Spawn an interactive shell inside the distro with piped stdio.
+    ///
+    /// Returns a `Child` whose stdin/stdout/stderr can be wired to a terminal
+    /// emulator (e.g. xterm.js in Velocitty).
+    pub fn spawn_shell(&self) -> Result<Child> {
+        process::spawn_wsl_interactive(&[
+            "-d", &self.name, "--cd", "/root", "--", "/bin/sh", "-i",
+        ])
+    }
+
+    /// Spawn an interactive shell with inherited stdio (for direct CLI use).
+    ///
+    /// Blocks the calling thread until the shell process exits.
+    pub fn spawn_shell_inherited(&self) -> Result<Child> {
+        process::spawn_wsl_inherited(&["-d", &self.name, "--cd", "/root", "--", "/bin/sh", "-l"])
     }
 }
